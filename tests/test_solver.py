@@ -4,7 +4,12 @@ import torch
 import torch_gmres.solver as solver  # Assuming this is your compiled module
 
 
-def create_test_problem(batch_size: int, n: int, dtype: torch.dtype, device: str = "cuda"):
+def create_test_problem(
+    batch_size: int,
+    n: int,
+    dtype: torch.dtype,
+    device: str = "cuda"
+):
     """Creates a batch of random linear systems Ax=b with known solutions."""
     # Create a random matrix A and normalize it
     a = torch.randn(batch_size, n, n, dtype=dtype, device=device)
