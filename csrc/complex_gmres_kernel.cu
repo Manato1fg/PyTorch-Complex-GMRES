@@ -331,7 +331,7 @@ std::vector<torch::Tensor> gmres_launcher(
         launch_smem_size = smem_reduce_size + converged_flag_size;
         
         // Allocate global memory for H, c, s, e1
-        H_global = torch::empty({B, (long long)(m + 1) * m}, options);
+        H_global = torch::empty({B, (m + 1) * m}, options);
         c_global = torch::empty({B, m}, options);
         s_global = torch::empty({B, m}, options);
         e1_global = torch::empty({B, m + 1}, options);
