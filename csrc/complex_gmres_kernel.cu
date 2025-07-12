@@ -81,8 +81,12 @@ __global__ void gmres_iterations_kernel(
     T* V, T* w,
     // Outputs (Global Memory)
     T* x_out, int* k_out, T_real* residuals_out,
+    // Workspace (Global Memory)
+    T* H_global, T* c_global, T* s_global, T* e1_global,
     // Parameters
-    int n, int m, T_real rtol, T_real atol, const T_real* b_norm_ptr, int block_size)
+    int n, int m, T_real rtol, T_real atol, const T_real* b_norm_ptr, int block_size,
+    // flag for shared memory usage
+    bool use_shared_memory)
 {
     const int batch_idx = blockIdx.x;
     const int tid = threadIdx.x;
@@ -96,13 +100,31 @@ __global__ void gmres_iterations_kernel(
     x_out += batch_idx * n;
     residuals_out += batch_idx * (m + 1);
 
+    // 共有メモリを確保 (リダクションバッファと収束フラグは常に共有メモリが望ましい)
     extern __shared__ char smem_main[];
     T* reduce_buffer    = reinterpret_cast<T*>(smem_main);
-    T* H                = reduce_buffer + block_size;
-    T* c                = H + (m + 1) * m;
-    T* s                = c + m;
-    T* e1               = s + m;
-    bool* converged_flag = reinterpret_cast<bool*>(e1 + m + 1);
+    bool* converged_flag = reinterpret_cast<bool*>(reduce_buffer + block_size);
+
+    if (use_shared_memory) {
+        // --- 共有メモリパス ---
+        // 共有メモリからポインタを設定
+        H  = reinterpret_cast<T*>(converged_flag + 1);
+        c  = H + (m + 1) * m;
+        s  = c + m;
+        e1 = s + m;
+    } else {
+        // --- グローバルメモリパス ---
+        // グローバルメモリのポインタをバッチインデックスでオフセットして設定
+        const size_t h_size = (size_t)(m + 1) * m;
+        const size_t c_size = m;
+        const size_t s_size = m;
+        const size_t e1_size = m + 1;
+        
+        H = H_global + batch_idx * h_size;
+        c = c_global + batch_idx * c_size;
+        s = s_global + batch_idx * s_size;
+        e1 = e1_global + batch_idx * e1_size;
+    }
 
     // 0. Initialize: r = b - A @ x
     for (int i = tid; i < n; i += blockDim.x) {
@@ -280,20 +302,40 @@ std::vector<torch::Tensor> gmres_launcher(
     auto k_out = torch::empty({B}, options.dtype(torch::kInt));
     auto residuals_out = torch::empty({B, m + 1}, options.dtype(A.dtype() == torch::kComplexFloat ? torch::kFloat : torch::kDouble));
 
-    // --- Calculate Shared Memory Size ---
+    // get the device properties to determine shared memory limits
+    cudaDeviceProp props;
+    cudaGetDeviceProperties(&props, A.device().index());
+    const size_t max_smem_per_block = props.sharedMemPerBlock;
+
+    // calculate the size of shared memory needed for the kernel
     const int block_size = 256;
-    size_t smem_H_size = (m + 1) * m * A.element_size();
-    size_t smem_c_s_size = 2 * m * A.element_size();
-    size_t smem_e1_size = (m + 1) * A.element_size();
     size_t smem_reduce_size = block_size * A.element_size();
     size_t converged_flag_size = sizeof(bool);
     
-    // Add padding to ensure bool is properly aligned
-    size_t total_smem = smem_reduce_size + smem_H_size + smem_c_s_size + smem_e1_size;
-    if (total_smem % alignof(bool) != 0) {
-        total_smem += alignof(bool) - (total_smem % alignof(bool));
+    // Calculate sizes for H, c, s, e1
+    size_t smem_H_size = (size_t)(m + 1) * m * A.element_size();
+    size_t smem_c_s_e1_size = (size_t)(m + m + m + 1) * A.element_size();
+    size_t required_full_smem = smem_reduce_size + converged_flag_size + smem_H_size + smem_c_s_e1_size;
+
+    // Check if we can use shared memory
+    bool use_shared_memory = (required_full_smem <= max_smem_per_block);
+    
+    size_t launch_smem_size;
+    torch::Tensor H_global, c_global, s_global, e1_global;
+
+    if (use_shared_memory) {
+        // shared memory path
+        launch_smem_size = required_full_smem;
+    } else {
+        // global memory path
+        launch_smem_size = smem_reduce_size + converged_flag_size;
+        
+        // Allocate global memory for H, c, s, e1
+        H_global = torch::empty({B, (long long)(m + 1) * m}, options);
+        c_global = torch::empty({B, m}, options);
+        s_global = torch::empty({B, m}, options);
+        e1_global = torch::empty({B, m + 1}, options);
     }
-    total_smem += converged_flag_size;
 
     // --- Kernel Launch Configuration ---
     const int grid_size = B;
@@ -301,13 +343,18 @@ std::vector<torch::Tensor> gmres_launcher(
     AT_DISPATCH_COMPLEX_TYPES(A.scalar_type(), "gmres_launcher", [&] {
         using real_t = typename scalar_t::value_type;
 
-        gmres_iterations_kernel<scalar_t, real_t><<<grid_size, block_size, total_smem>>>(
+        gmres_iterations_kernel<scalar_t, real_t><<<grid_size, block_size, launch_smem_size>>>(
             A.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), x0.data_ptr<scalar_t>(),
             V.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(),
             x_out.data_ptr<scalar_t>(), k_out.data_ptr<int>(), residuals_out.data_ptr<real_t>(),
+            use_shared_memory ? nullptr : H_global.data_ptr<scalar_t>(),
+            use_shared_memory ? nullptr : c_global.data_ptr<scalar_t>(),
+            use_shared_memory ? nullptr : s_global.data_ptr<scalar_t>(),
+            use_shared_memory ? nullptr : e1_global.data_ptr<scalar_t>(),
             N, m, static_cast<real_t>(rtol), static_cast<real_t>(atol),
             b_norm.data_ptr<real_t>(),
-            block_size
+            block_size,
+            use_shared_memory,
         );
     });
 

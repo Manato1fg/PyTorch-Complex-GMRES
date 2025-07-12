@@ -58,7 +58,7 @@ def test_gmres_with_restart(dtype: torch.dtype):
     torch.testing.assert_close(solution_b, b, rtol=1e-5, atol=1e-8)
 
 
-def test_gmres_large_sparse_system():
+def _test_gmres_large_sparse_system(m: int):
     """
     Tests GMRES on a larger, sparse, well-conditioned system.
     This verifies correctness by comparing against the known true solution.
@@ -90,10 +90,19 @@ def test_gmres_large_sparse_system():
     b_batch = torch.cat(b_list, dim=0)
 
     # Run the solver
-    result = solver.gmres(A, b_batch, m=40, rtol=1e-9, atol=1e-9)
+    result = solver.gmres(A, b_batch, m=m, rtol=1e-9, atol=1e-9)
 
     # Verify that the solver's solution is close to the known true solution
     torch.testing.assert_close(result.solution, x_true_batch, rtol=1e-5, atol=1e-8)
+
+
+@pytest.mark.parametrize("m", [20, 100])
+def test_gmres_large_sparse_system(m: int):
+    """
+    Parametrized test for GMRES on a larger, sparse, well-conditioned system.
+    This verifies correctness by comparing against the known true solution.
+    """
+    _test_gmres_large_sparse_system(m)
 
 
 if __name__ == "__main__":
