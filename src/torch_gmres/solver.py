@@ -48,7 +48,7 @@ def gmres(
         atol (float, optional): The absolute tolerance for convergence.
             Defaults to 1e-8.
         max_restarts (int, optional): The maximum number of restarts.
-            Defaults to N // m.
+            If None, restarts until convergence. Defaults to None.
         verbose (bool, optional): If True, prints restart progress. Defaults to False.
 
     Returns:
@@ -72,16 +72,14 @@ def gmres(
 
     current_x = torch.zeros_like(b) if x0 is None else x0.clone()
 
-    if max_restarts is None:
-        max_restarts = N // m
-
     total_iterations = torch.zeros(B, dtype=torch.int32, device=A.device)
 
     _A = A.contiguous()
     _b = b.contiguous()
     current_x = current_x.contiguous()
 
-    for i in range(max_restarts + 1):
+    i = 0
+    while max_restarts is None or i < max_restarts:
         # r = b - A @ x for the current guess
         r = _b - torch.einsum('bij,bj->bi', _A, current_x)
 
@@ -109,9 +107,7 @@ def gmres(
                 print(
                     f"Converged after {i} restarts and {torch.max(total_iterations).item()} total iterations.")  # noqa: E501
             break
-
-        if i == max_restarts and verbose:
-            print("Warning: GMRES reached the maximum number of restarts without full convergence.")  # noqa: E501
+        i += 1
 
     return GMRESResult(
         solution=current_x.view(B, N),
