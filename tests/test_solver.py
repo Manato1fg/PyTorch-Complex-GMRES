@@ -9,7 +9,7 @@ def create_test_problem(
     n: int,
     dtype: torch.dtype,
     device: str = "cuda",
-    norm_limit: float = 1.0
+    norm_limit: float = 0.5
 ):
     """Creates a batch of random linear systems Ax=b with known solutions."""
     # Create a random matrix A and normalize it
