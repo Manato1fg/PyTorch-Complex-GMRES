@@ -8,12 +8,13 @@ def create_test_problem(
     batch_size: int,
     n: int,
     dtype: torch.dtype,
-    device: str = "cuda"
+    device: str = "cuda",
+    norm_limit: float = 1.0
 ):
     """Creates a batch of random linear systems Ax=b with known solutions."""
     # Create a random matrix A and normalize it
     a = torch.randn(batch_size, n, n, dtype=dtype, device=device)
-    a = a / torch.linalg.norm(a, dim=(1, 2), keepdim=True)
+    a = a / torch.linalg.norm(a, dim=(1, 2), keepdim=True) * norm_limit
 
     # Create a known random solution vector x_true and normalize it
     x_true = torch.randn(batch_size, n, dtype=dtype, device=device)
@@ -37,6 +38,27 @@ def test_gmres_full_cycle(dtype: torch.dtype):
     # Run the solver with m=N (no restart needed)
     result = solver.gmres(A, b, m=N, rtol=1e-9, atol=1e-9)
     torch.testing.assert_close(result.solution, x_truth, rtol=1e-5, atol=1e-8)
+
+
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+def test_gmres_infinite_reflection(dtype: torch.dtype):
+    """
+    Tests GMRES for a full cycle (m=N), which should converge in one go.
+    This checks the correctness of the core Arnoldi iteration and solve.
+    """
+    N = 4096
+    A, _, _ = create_test_problem(batch_size=1, n=N, dtype=dtype, norm_limit=1.0)
+    real_dtype = torch.float64 if dtype == torch.complex128 else torch.float32
+    x_phase = torch.randn(N, dtype=real_dtype, device=A.device) * 2 * 3.14159
+    x_truth = torch.exp(1j * x_phase)  # Create a complex vector with random phases
+    B = (torch.eye(N, dtype=dtype, device=A.device) -
+         torch.diag_embed(x_truth) @ A[0]).to(A.device).unsqueeze(0)
+
+    # Run the solver with m=N (no restart needed)
+    result = solver.gmres(B, x_truth, m=20, rtol=1e-9, atol=1e-9)
+
+    z_truth = torch.linalg.solve(B[0], x_truth)
+    torch.testing.assert_close(result.solution[0], z_truth, rtol=1e-5, atol=1e-8)
 
 
 @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
