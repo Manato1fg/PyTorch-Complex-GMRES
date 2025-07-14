@@ -77,9 +77,13 @@ def gmres(
 
     total_iterations = torch.zeros(B, dtype=torch.int32, device=A.device)
 
+    _A = A.contiguous()
+    _b = b.contiguous()
+    current_x = current_x.contiguous()
+
     for i in range(max_restarts + 1):
         # r = b - A @ x for the current guess
-        r = b - torch.einsum('bij,bj->bi', A, current_x)
+        r = _b - torch.einsum('bij,bj->bi', _A, current_x)
 
         if verbose:
             print(f"Restart {i}, Max Iterations: {torch.max(total_iterations).item()}")
@@ -89,7 +93,7 @@ def gmres(
         # Therefore, the initial "guess" passed to the kernel should be a zero vector,
         # and the "b" vector should be the current residual "r".
         x_update, ks, residuals = torch_gmres_cuda.run_iterations(
-            A, r, torch.zeros_like(r), b_norm, m, rtol, atol
+            _A, r, torch.zeros_like(r), m, rtol, atol
         )
 
         current_x += x_update
@@ -97,7 +101,7 @@ def gmres(
 
         # Get the residual at the end of the cycle for each batch item.
         # ks is 1-based, so subtract 1 for 0-based indexing.
-        actual_indices = (ks - 1).clamp(min=0).view(-1, 1).to(torch.int64)
+        actual_indices = ks.view(-1, 1).to(torch.int64)
         actual_residuals = torch.gather(residuals, 1, actual_indices).squeeze(1)
 
         # Check for convergence

@@ -32,14 +32,11 @@ def test_gmres_full_cycle(dtype: torch.dtype):
     This checks the correctness of the core Arnoldi iteration and solve.
     """
     N = 30
-    A, b, _ = create_test_problem(batch_size=2, n=N, dtype=dtype)
+    A, b, x_truth = create_test_problem(batch_size=2, n=N, dtype=dtype)
 
     # Run the solver with m=N (no restart needed)
     result = solver.gmres(A, b, m=N, rtol=1e-9, atol=1e-9)
-
-    # Verify that the calculated solution solves the system Ax=b
-    solution_b = torch.einsum('bij,bj->bi', A, result.solution)
-    torch.testing.assert_close(solution_b, b, rtol=1e-5, atol=1e-8)
+    torch.testing.assert_close(result.solution, x_truth, rtol=1e-5, atol=1e-8)
 
 
 @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
@@ -86,14 +83,14 @@ def _test_gmres_large_sparse_system(m: int):
         x_true_list.append(x_true)
         b_list.append(b)
     A = A.repeat(BATCH_SIZE, 1, 1)  # Batch the matrix
-    x_true_batch = torch.cat(x_true_list, dim=0)
     b_batch = torch.cat(b_list, dim=0)
 
     # Run the solver
     result = solver.gmres(A, b_batch, m=m, rtol=1e-9, atol=1e-9)
+    b_solution = torch.einsum('bij,bj->bi', A, result.solution)
 
-    # Verify that the solver's solution is close to the known true solution
-    torch.testing.assert_close(result.solution, x_true_batch, rtol=1e-5, atol=1e-8)
+    # Verify that the calculated solution solves the system Ax=b
+    torch.testing.assert_close(b_solution, b_batch, rtol=1e-5, atol=1e-8)
 
 
 @pytest.mark.parametrize("m", [20, 100])

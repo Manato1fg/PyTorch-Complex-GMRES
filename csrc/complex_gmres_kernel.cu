@@ -68,6 +68,7 @@ __device__ T_real norm_sq(int n, const T* v, void* shared_mem) {
     return block_reduce_sum_real<T_real>(thread_sum, shared_val_real);
 }
 
+
 /**
  * @brief Executes one cycle of iterative computations for the GMRES method.
  * @tparam T Complex type (c10::complex<float> or c10::complex<double>).
@@ -75,17 +76,11 @@ __device__ T_real norm_sq(int n, const T* v, void* shared_mem) {
  */
 template <typename T, typename T_real>
 __global__ void gmres_iterations_kernel(
-    // Inputs
     const T* A, const T* b, const T* x,
-    // Workspace (Global Memory)
     T* V, T* w,
-    // Outputs (Global Memory)
     T* x_out, int* k_out, T_real* residuals_out,
-    // Workspace (Global Memory)
-    T* H_global, T* c_global, T* s_global, T* e1_global,
-    // Parameters
-    int n, int m, T_real rtol, T_real atol, const T_real* b_norm_ptr, int block_size,
-    // flag for shared memory usage
+    T* H_global, T* c_global, T* s_global, T* e1_global, T* y_global,
+    int n, int m, T_real rtol, T_real atol, int block_size,
     bool use_shared_memory)
 {
     const int batch_idx = blockIdx.x;
@@ -100,30 +95,39 @@ __global__ void gmres_iterations_kernel(
     x_out += batch_idx * n;
     residuals_out += batch_idx * (m + 1);
 
-    // 共有メモリを確保 (リダクションバッファと収束フラグは常に共有メモリが望ましい)
-    extern __shared__ char smem_main[];
-    T* reduce_buffer    = reinterpret_cast<T*>(smem_main);
-    bool* converged_flag = reinterpret_cast<bool*>(reduce_buffer + block_size);
+    auto align_ptr = [](void* ptr, size_t alignment) {
+        return (void*)(((uintptr_t)ptr + alignment - 1) & ~(alignment - 1));
+    };
 
+    // allocate shared memory for the kernel
+    extern __shared__ char smem_main[];
+    T* reduce_buffer = reinterpret_cast<T*>(smem_main);
+    size_t T_align = alignof(T);
+    void* ptr_after_reduce = reduce_buffer + block_size;
+    bool* converged_flag = reinterpret_cast<bool*>(align_ptr(ptr_after_reduce, alignof(bool)));
+
+    T* H, *c, *s, *e1, *y;
     if (use_shared_memory) {
-        // --- 共有メモリパス ---
-        // 共有メモリからポインタを設定
-        H  = reinterpret_cast<T*>(converged_flag + 1);
-        c  = H + (m + 1) * m;
-        s  = c + m;
-        e1 = s + m;
-    } else {
-        // --- グローバルメモリパス ---
-        // グローバルメモリのポインタをバッチインデックスでオフセットして設定
-        const size_t h_size = (size_t)(m + 1) * m;
-        const size_t c_size = m;
-        const size_t s_size = m;
-        const size_t e1_size = m + 1;
-        
-        H = H_global + batch_idx * h_size;
-        c = c_global + batch_idx * c_size;
-        s = s_global + batch_idx * s_size;
-        e1 = e1_global + batch_idx * e1_size;
+        // --- Shared Memory Path ---
+        // Set pointers from shared memory
+        void* ptr_after_flag = converged_flag + 1;
+        H = reinterpret_cast<T*>(align_ptr(ptr_after_flag, T_align));
+        void* ptr_after_H = H + (m + 1) * m;
+        c = reinterpret_cast<T*>(align_ptr(ptr_after_H, T_align));
+        void* ptr_after_c = c + m;
+        s = reinterpret_cast<T*>(align_ptr(ptr_after_c, T_align));
+        void* ptr_after_s = s + m;
+        e1 = reinterpret_cast<T*>(align_ptr(ptr_after_s, T_align));
+        void* ptr_after_e1 = e1 + (m + 1);
+        y = reinterpret_cast<T*>(align_ptr(ptr_after_e1, T_align));
+    } else {      
+        // --- Global Memory Path ---
+        // Set pointers to global memory  
+        H = H_global + batch_idx * (m + 1) * m;
+        c = c_global + batch_idx * m;
+        s = s_global + batch_idx * m;
+        e1 = e1_global + batch_idx * (m + 1);
+        y = y_global + batch_idx * m;
     }
 
     // 0. Initialize: r = b - A @ x
@@ -148,13 +152,12 @@ __global__ void gmres_iterations_kernel(
     }
 
     if (tid == 0) {
-        for(int i = 1; i <= m; ++i) e1[i] = T(0.0, 0.0);
+        for(int i = 1; i <= m; ++i) {e1[i] = T(0.0, 0.0); residuals_out[i] = 0.0;}
         e1[0] = T(beta, 0.0);
         *converged_flag = false;
+        residuals_out[0] = beta;
     }
     __syncthreads();
-    
-    if (tid == 0) residuals_out[0] = beta;
 
     for (int i = tid; i < n; i += blockDim.x) {
         V[i * (m + 1) + 0] = w[i] / e1[0];
@@ -186,7 +189,7 @@ __global__ void gmres_iterations_kernel(
             __syncthreads();
 
             for (int i = tid; i < n; i += blockDim.x) {
-                w[i] = w[i] - H[j * m + k] * V[i * (m + 1) + j];
+                w[i] = w[i] - h_jk * V[i * (m + 1) + j];
             }
             __syncthreads();
         }
@@ -195,8 +198,8 @@ __global__ void gmres_iterations_kernel(
         __syncthreads();
         
         if (tid == 0) H[(k + 1) * m + k] = T(h_k1_k, 0.0);
-        T h_k1_k_complex = T(h_k1_k, 0.0);
         __syncthreads();
+        T h_k1_k_complex = T(h_k1_k, 0.0);
 
         for (int i = tid; i < n; i += blockDim.x) {
             if (h_k1_k > 1e-12) {
@@ -229,15 +232,12 @@ __global__ void gmres_iterations_kernel(
             H[(k + 1) * m + k] = T(0.0, 0.0);
 
             T e1_k = e1[k];
-            T e1_k1 = e1[k + 1];
-            e1[k] = std::conj(c[k]) * e1_k + std::conj(s[k]) * e1_k1;
-            e1[k + 1] = -s[k] * e1_k + c[k] * e1_k1;
+            e1[k] = std::conj(c[k]) * e1_k;
+            e1[k + 1] = -s[k] * e1_k;
 
             T_real residual = std::abs(e1[k + 1]);
             residuals_out[k + 1] = residual;
-
-            T_real b_norm = static_cast<T_real>(b_norm_ptr[batch_idx]);
-            T_real acceptance_tol = atol + rtol * b_norm;
+            T_real acceptance_tol = atol + rtol * beta;
 
             if (residual < acceptance_tol) {
                 *converged_flag = true;
@@ -249,26 +249,21 @@ __global__ void gmres_iterations_kernel(
             break;
         }
     }
-
-    int num_iters;
-    if (k < m) {
-        num_iters = k + 1;
-    } else {
-        num_iters = m;
+    __syncthreads();
+    int num_iterations = k + 1;
+    if (num_iterations > m) {
+        num_iterations = m;
     }
-
-    // 2. Solve the least-squares problem and update solution
     if (tid == 0) {
-        // workspace w will be repurposed to store the solution y
-        for (int j = num_iters - 1; j >= 0; --j) {
+        for (int i = num_iterations - 1; i >= 0; --i) {
             T sum = T(0.0, 0.0);
-            for (int i = j + 1; i < num_iters; ++i) {
-                sum = sum + H[j * m + i] * w[i];
+            for (int j = i + 1; j < num_iterations; ++j) {
+                sum = sum + H[i * m + j] * y[j];
             }
-            if (std::abs(H[j * m + j]) > 1e-12) {
-                w[j] = (e1[j] - sum) / H[j * m + j];
+            if (std::abs(H[i * m + i]) > 1e-12) {
+                y[i] = (e1[i] - sum) / H[i * m + i];
             } else {
-                w[j] = T(0.0, 0.0);
+                y[i] = T(0.0, 0.0);
             }
         }
     }
@@ -276,20 +271,20 @@ __global__ void gmres_iterations_kernel(
 
     for (int i = tid; i < n; i += blockDim.x) {
         T sum = T(0.0, 0.0);
-        for (int j = 0; j < num_iters; ++j) {
-            sum = sum + w[j] * V[i * (m + 1) + j];
+        for (int j = 0; j < num_iterations; ++j) {
+            sum = sum + y[j] * V[i * (m + 1) + j];
         }
-        x_out[i] = x[i] + sum;
+        x_out[i] = sum;
     }
     __syncthreads();
 
     if (tid == 0) {
-        k_out[batch_idx] = num_iters;
+        k_out[batch_idx] = num_iterations;
     }
 }
 
 std::vector<torch::Tensor> gmres_launcher(
-    torch::Tensor A, torch::Tensor b, torch::Tensor x0, torch::Tensor b_norm,
+    torch::Tensor A, torch::Tensor b, torch::Tensor x0,
     int m, double rtol, double atol)
 {
     const auto B = A.size(0);
@@ -308,33 +303,56 @@ std::vector<torch::Tensor> gmres_launcher(
     const size_t max_smem_per_block = props.sharedMemPerBlock;
 
     // calculate the size of shared memory needed for the kernel
-    const int block_size = 256;
-    size_t smem_reduce_size = block_size * A.element_size();
+    const int block_size = 256; // Use a fixed block size, can be tuned
+    auto align_size = [](size_t size, size_t alignment) {
+        return (size + alignment - 1) & ~(alignment - 1);
+    };
+    size_t T_size = A.element_size();
+    size_t T_align = T_size;
+
+    size_t smem_reduce_offset = 0;
+    size_t smem_reduce_size = block_size * T_size;
+
+    size_t converged_flag_offset = align_size(smem_reduce_offset + smem_reduce_size, alignof(bool));
     size_t converged_flag_size = sizeof(bool);
-    
-    // Calculate sizes for H, c, s, e1
-    size_t smem_H_size = (size_t)(m + 1) * m * A.element_size();
-    size_t smem_c_s_e1_size = (size_t)(m + m + m + 1) * A.element_size();
-    size_t required_full_smem = smem_reduce_size + converged_flag_size + smem_H_size + smem_c_s_e1_size;
+
+    size_t smem_H_offset = align_size(converged_flag_offset + converged_flag_size, T_align);
+    size_t smem_H_size = (size_t)(m + 1) * m * T_size;
+
+    size_t smem_c_offset = align_size(smem_H_offset + smem_H_size, T_align);
+    size_t smem_c_size = (size_t)m * T_size;
+
+    size_t smem_s_offset = align_size(smem_c_offset + smem_c_size, T_align);
+    size_t smem_s_size = (size_t)m * T_size;
+
+    size_t smem_e1_offset = align_size(smem_s_offset + smem_s_size, T_align);
+    size_t smem_e1_size = (size_t)(m + 1) * T_size;
+
+    size_t smem_y_offset = align_size(smem_e1_offset + smem_e1_size, T_align);
+    size_t smem_y_size = (size_t)(m + 1) * T_size;
+
+    size_t required_full_smem = smem_y_offset + smem_y_size;
 
     // Check if we can use shared memory
     bool use_shared_memory = (required_full_smem <= max_smem_per_block);
     
     size_t launch_smem_size;
-    torch::Tensor H_global, c_global, s_global, e1_global;
+    torch::Tensor H_global, c_global, s_global, e1_global, y_global;
 
     if (use_shared_memory) {
         // shared memory path
         launch_smem_size = required_full_smem;
     } else {
         // global memory path
-        launch_smem_size = smem_reduce_size + converged_flag_size;
+        size_t smem_for_reduce_flag = align_size(smem_reduce_size, alignof(bool)) + sizeof(bool);
+        launch_smem_size = smem_for_reduce_flag;
         
         // Allocate global memory for H, c, s, e1
         H_global = torch::empty({B, (m + 1) * m}, options);
         c_global = torch::empty({B, m}, options);
         s_global = torch::empty({B, m}, options);
         e1_global = torch::empty({B, m + 1}, options);
+        y_global = torch::empty({B}, options);
     }
 
     // --- Kernel Launch Configuration ---
@@ -351,10 +369,10 @@ std::vector<torch::Tensor> gmres_launcher(
             use_shared_memory ? nullptr : c_global.data_ptr<scalar_t>(),
             use_shared_memory ? nullptr : s_global.data_ptr<scalar_t>(),
             use_shared_memory ? nullptr : e1_global.data_ptr<scalar_t>(),
+            use_shared_memory ? nullptr : y_global.data_ptr<scalar_t>(),
             N, m, static_cast<real_t>(rtol), static_cast<real_t>(atol),
-            b_norm.data_ptr<real_t>(),
             block_size,
-            use_shared_memory,
+            use_shared_memory
         );
     });
 
