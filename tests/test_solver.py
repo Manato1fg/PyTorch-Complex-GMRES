@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-import torch_gmres.solver as solver  # Assuming this is your compiled module
+import torch_gmres.solver as solver
 
 
 def create_test_problem(
