@@ -99,8 +99,6 @@ def gmres(
         current_x += x_update
         total_iterations += ks
 
-        # Get the residual at the end of the cycle for each batch item.
-        # ks is 1-based, so subtract 1 for 0-based indexing.
         actual_indices = ks.view(-1, 1).to(torch.int64)
         actual_residuals = torch.gather(residuals, 1, actual_indices).squeeze(1)
 
