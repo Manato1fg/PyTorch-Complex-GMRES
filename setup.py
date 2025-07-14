@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 setup(
-    name='torch-gmres',
+    name='pytorch_complex_gmres',
     # 1. Tell setuptools the root of packages is the 'src' directory
     package_dir={'': 'src'},
     # 2. Find packages inside the 'src' directory
