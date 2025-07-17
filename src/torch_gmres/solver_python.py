@@ -1,17 +1,6 @@
-from dataclasses import dataclass
-from typing import Optional, Tuple
-
 import torch
 
-
-@dataclass
-class GMRESState:
-    """
-    State dataclass for GMRES.
-    """
-    num_iter: int
-    x: torch.Tensor
-    residual_norm: torch.Tensor
+from torch_gmres import GMRESResult
 
 
 class GMRESStepResult:
@@ -40,21 +29,11 @@ class GMRESStepResult:
         self.e1 = e1
 
 
-@dataclass
-class GMRESConfig:
-    """
-    Config dataclass for GMRES.
-    """
-    atol: float = 1e-6
-    rtol: float = 1e-5
-    max_iter: Optional[int] = None
-
-
-# @torch.jit.script
+@torch.jit.script
 def calculate_givens_rotation(
     a: torch.Tensor,
     b: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Computes coefficients for a complex-safe Givens rotation.
 
@@ -71,13 +50,13 @@ def calculate_givens_rotation(
     return c, s
 
 
-# @torch.jit.script
+@torch.jit.script
 def apply_givens_rotation(
     H: torch.Tensor,
     c: torch.Tensor,
     s: torch.Tensor,
     k: int
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Apply a complex-safe Givens rotation to the H matrix (Corrected version).
     """
@@ -101,7 +80,7 @@ def apply_givens_rotation(
     return H, c, s
 
 
-# @torch.jit.script
+@torch.jit.script
 def gmres_step(
     A: torch.Tensor,
     V: torch.Tensor,
@@ -120,7 +99,7 @@ def gmres_step(
     # Arnoldi's method with modified Gram-Schmidt orthogonalization
     for j in range(k + 1):
         # (B, N) @ (B, N) = (B, 1)
-        H[:, j, k] = torch.sum(torch.conj_physical(w) * V[:, :, j], dim=-1)
+        H[:, j, k] = torch.sum(w * torch.conj_physical(V[:, :, j]), dim=-1)
         w = w - H[:, j, k].unsqueeze(-1) * V[:, :, j]
     H[:, k + 1, k] = torch.norm(w, dim=-1)
     V[:, :, k + 1] = w / H[:, k + 1, k].unsqueeze(-1)
@@ -138,7 +117,6 @@ def gmres_step(
 
     # Update residual norm
     residual_norm = torch.abs(e1[:, k + 1])
-
     result = GMRESStepResult(
         is_converged=False,
         residual_norm=residual_norm,
@@ -153,13 +131,13 @@ def gmres_step(
     return result
 
 
-def gmres(
+def _gmres(
     A: torch.Tensor,
     b: torch.Tensor,
-    x0: Optional[torch.Tensor],
-    config: GMRESConfig,
-    tol: torch.Tensor
-) -> GMRESState:
+    x0: torch.Tensor,
+    tol: torch.Tensor,
+    m: int = 50,
+) -> GMRESResult:
     """
     Generalized minimal residual method (GMRES)
     solve AX = B, where B is a batch of right-hand side vectors.
@@ -167,57 +145,42 @@ def gmres(
     Args:
         A: (N, N) or (B, N, N)
         b: (B, N)
-        x0: (B, N)
-        tol: float
-        max_iter: int
-        restart: int
+        tol: convergence tolerance
+        x0: initial guess
+        m: restart parameter, number of iterations before restart
 
     Returns:
-        GMRESState: The state of the GMRES method.
+        GMRESResult:
     """
-    max_iter = config.max_iter
-
     if b.ndim == 1:
         b = b.unsqueeze(0)
-        if x0 is not None:
-            x0 = x0.unsqueeze(0)
+    if x0.ndim == 1:
+        x0 = x0.unsqueeze(0)
     B = b.shape[0]
     if A.ndim == 2:
         A = A.unsqueeze(0)
 
     device = A.device
     dtype = A.dtype
-
-    # Compute initial residual
-    if x0 is None:
-        x0 = torch.zeros_like(b, device=device, dtype=dtype)
-        r = b
-    else:
-        assert x0.shape[0] == B
-        r = b - torch.einsum("bij,bj->bi", A, x0)
+    assert x0.shape[0] == B
+    r = b - torch.einsum("bij,bj->bi", A, x0)
     beta = torch.norm(r, dim=-1, keepdim=True)
-
-    # Set max_iter
-    if max_iter is None:
-        max_iter = b.shape[1]
-
-    H = torch.zeros(B, max_iter + 1, max_iter,
-                    dtype=dtype, device=device)
-    V = torch.zeros(B, b.shape[1], max_iter + 1, dtype=dtype, device=device)  # noqa: E501
+    H = torch.zeros(B, m + 1, m, dtype=dtype, device=device)
+    V = torch.zeros(B, b.shape[1], m + 1, dtype=dtype, device=device)  # noqa: E501
     V[:, :, 0] = r / beta
 
-    e1 = torch.zeros(B, max_iter + 1, dtype=dtype, device=device)
+    e1 = torch.zeros(B, m + 1, dtype=dtype, device=device)
     e1[:, 0] = beta.squeeze(-1)
 
-    c = torch.zeros(B, max_iter, dtype=dtype, device=device)
-    s = torch.zeros(B, max_iter, dtype=dtype, device=device)
+    c = torch.zeros(B, m, dtype=dtype, device=device)
+    s = torch.zeros(B, m, dtype=dtype, device=device)
 
     # Initialize residual norm
     residual_norm = beta
 
     # GMRES iterations
     k = 0
-    for k in range(max_iter):
+    for k in range(m):
         result = gmres_step(
             A, V, H, c, s, e1, residual_norm, k, tol)
         V = result.V
@@ -236,47 +199,40 @@ def gmres(
     ).squeeze(-1)
 
     x = x0 + torch.einsum("bij,bj->bi", V[:, :, :k + 1], y)
-    return GMRESState(
-        x=x,
-        num_iter=k + 1,
-        residual_norm=residual_norm.abs().max()
+    return GMRESResult(
+        solution=x,
+        num_iterations=torch.tensor(k + 1, dtype=torch.int32, device=device).repeat(B),
+        residuals=residual_norm
     )
 
 
-def gmres_with_restart(
+def gmres(
     A: torch.Tensor,
     b: torch.Tensor,
-    x0: Optional[torch.Tensor],
-    config: GMRESConfig,
-    restart: int
-) -> GMRESState:
+    x0: torch.Tensor | None = None,
+    m: int = 50,
+    rtol: float = 1e-5,
+    atol: float = 1e-8,
+    max_restarts: int | None = None,
+) -> GMRESResult:
     if b.ndim == 1:
         b = b.unsqueeze(0)
         if x0 is not None:
             x0 = x0.unsqueeze(0)
-    max_iter = config.max_iter
-    if max_iter is None:
-        max_iter = b.shape[1]
+    if x0 is None:
+        x0 = torch.zeros_like(b, dtype=b.dtype, device=b.device)
 
-    if restart <= 0:
-        raise ValueError("restart must be positive")
-    if restart > max_iter:
-        raise ValueError("restart must be less than max_iter")
+    tol = atol + rtol * torch.linalg.norm(b, dim=-1, keepdim=True)
 
     result = None
-    r0 = b - torch.einsum("bij,bj->bi", A, x0) if x0 is not None else b
-    r0_norm = torch.norm(r0, dim=-1, keepdim=True)
-    tol = config.atol + config.rtol * r0_norm
     i = 0
-    for i in range(0, max_iter, restart):
-        iter_for_restart = min(restart, max_iter - i)
-        config.max_iter = iter_for_restart
-        result = gmres(A, b, x0, config, tol)
-        if torch.all(result.residual_norm < tol):
+    while max_restarts is None or i < max_restarts:
+        result = _gmres(A, b, x0, tol, m)
+        if torch.all(result.residuals < tol):
             break
-        x0 = result.x
+        x0 = result.solution
+        i += 1
     if result is None:
         raise RuntimeError("Unknown error in GMRES with restart")
-    result.num_iter = i + result.num_iter
-    config.max_iter = max_iter
+    result.num_iterations = i * m + result.num_iterations
     return result
