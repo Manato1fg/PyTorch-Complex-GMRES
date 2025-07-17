@@ -1,23 +1,9 @@
-"""
-Solver for Batched GMRES using a Custom CUDA Kernel
-===================================================
-"""
-from dataclasses import dataclass
-
 import torch
+
+from torch_gmres import GMRESResult
 
 # This assumes your compiled module is named 'torch_gmres_cuda'
 from . import cuda as torch_gmres_cuda
-
-
-@dataclass
-class GMRESResult:
-    """
-    Result class for the GMRES solver.
-    """
-    solution: torch.Tensor
-    num_iterations: torch.Tensor
-    residuals: torch.Tensor
 
 
 @torch.no_grad()
