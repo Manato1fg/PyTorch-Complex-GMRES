@@ -160,7 +160,7 @@ __global__ void gmres_iterations_kernel(
     __syncthreads();
 
     for (int i = tid; i < n; i += blockDim.x) {
-        V[i * (m + 1) + 0] = w[i] / e1[0];
+        V[i] = w[i] / e1[0];
     }
     __syncthreads();
 
@@ -171,7 +171,7 @@ __global__ void gmres_iterations_kernel(
         for (int i = tid; i < n; i += blockDim.x) {
             T aw = T(0.0, 0.0);
             for (int j = 0; j < n; ++j) {
-                aw = aw + A[i * n + j] * V[j * (m + 1) + k];
+                aw = aw + A[i * n + j] * V[k * n + j];
             }
             w[i] = aw;
         }
@@ -181,7 +181,7 @@ __global__ void gmres_iterations_kernel(
         for (int j = 0; j <= k; ++j) {
             T thread_sum = T(0.0, 0.0);
             for (int i = tid; i < n; i += blockDim.x) {
-                thread_sum = thread_sum + w[i] * std::conj(V[i * (m + 1) + j]);
+                thread_sum = thread_sum + w[i] * std::conj(V[j * n + i]);
             }
             T h_jk = block_reduce_sum<T>(thread_sum, reduce_buffer);
             __syncthreads();
@@ -189,7 +189,7 @@ __global__ void gmres_iterations_kernel(
             __syncthreads();
 
             for (int i = tid; i < n; i += blockDim.x) {
-                w[i] = w[i] - h_jk * V[i * (m + 1) + j];
+                w[i] = w[i] - h_jk * V[j * n + i];
             }
             __syncthreads();
         }
@@ -203,9 +203,9 @@ __global__ void gmres_iterations_kernel(
 
         for (int i = tid; i < n; i += blockDim.x) {
             if (h_k1_k > 1e-12) {
-                 V[i * (m + 1) + (k + 1)] = w[i] / h_k1_k_complex;
+                 V[(k + 1) * n + i] = w[i] / h_k1_k_complex;
             } else {
-                 V[i * (m + 1) + (k + 1)] = T(0.0, 0.0);
+                 V[(k + 1) * n + i] = T(0.0, 0.0);
             }
         }
         __syncthreads();
@@ -272,7 +272,7 @@ __global__ void gmres_iterations_kernel(
     for (int i = tid; i < n; i += blockDim.x) {
         T sum = T(0.0, 0.0);
         for (int j = 0; j < num_iterations; ++j) {
-            sum = sum + y[j] * V[i * (m + 1) + j];
+            sum = sum + y[j] * V[j * n + i];
         }
         x_out[i] = sum;
     }
@@ -291,7 +291,7 @@ std::vector<torch::Tensor> gmres_launcher(
     const auto N = A.size(1);
     const auto options = A.options();
 
-    auto V = torch::empty({B, N, m + 1}, options);
+    auto V = torch::empty({B, m + 1, N}, options);
     auto w = torch::empty({B, N}, options);
     auto x_out = torch::empty({B, N}, options);
     auto k_out = torch::empty({B}, options.dtype(torch::kInt));
