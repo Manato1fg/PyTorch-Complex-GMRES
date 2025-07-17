@@ -10,18 +10,22 @@ from prettytable import PrettyTable
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark GMRES solver.")
-    parser.add_argument("--batch_size", type=int, default=10,
+    parser.add_argument("--batch_size", "-bs", type=int, default=10,
                         help="Batch size for the linear systems.")
-    parser.add_argument("--matrix_size", type=int, default=100,
+    parser.add_argument("--matrix_size", "-ms", type=int, default=100,
                         help="Size of the square matrix A.")
-    parser.add_argument("--num_trials", type=int, default=5,
+    parser.add_argument("--num_trials", "-nt",  type=int, default=5,
                         help="Number of trials for benchmarking.")
-    parser.add_argument("--m", type=int, default=50,
+    parser.add_argument("--m", "-m", type=int, default=50,
                         help="Restart cycle length (dimension of Krylov subspace).")
-    parser.add_argument("--atol", type=float, default=1e-8,
+    parser.add_argument("--atol", "-atol", type=float, default=1e-8,
                         help="Absolute tolerance for convergence.")
-    parser.add_argument("--rtol", type=float, default=1e-5,
+    parser.add_argument("--rtol", "-rtol", type=float, default=1e-5,
                         help="Relative tolerance for convergence.")
+    parser.add_argument("--simulate_infinite_reflection", "-s", action='store_true',
+                        help="Simulate infinite reflection in the benchmark.")
+    parser.add_argument("--norm_limit", "-nl", type=float, default=1.0,
+                        help="Limit for the norm of the matrix A.")
 
     args = parser.parse_args()
     batch_size = args.batch_size
@@ -30,16 +34,24 @@ if __name__ == "__main__":
     m = args.m
     atol = args.atol
     rtol = args.rtol
+    simulate_infinite_reflection = args.simulate_infinite_reflection
+    norm_limit = args.norm_limit
 
     result_path = "benchmark_results.json"
 
     A = torch.randn(num_trials, batch_size, matrix_size, matrix_size,
                     device='cuda', dtype=torch.complex128)
-    A /= torch.linalg.norm(A, dim=(-2, -1), keepdim=True)
+    A /= torch.linalg.norm(A, dim=(-2, -1), keepdim=True) * norm_limit
     x_true = torch.randn(num_trials, batch_size, matrix_size,
                          device='cuda', dtype=torch.complex128)
-    x_true /= torch.linalg.norm(x_true, dim=-1, keepdim=True)
-    b = torch.einsum("nbij,nbj->n bi", A, x_true)
+    if simulate_infinite_reflection:
+        identity = torch.eye(matrix_size, device='cuda',
+                             dtype=torch.complex128).unsqueeze(
+            0).unsqueeze(0).repeat(num_trials, batch_size, 1, 1)
+        A = (identity - x_true[:, :, :, None] * A)
+        b = x_true
+    else:
+        b = torch.einsum("nbij,nbj->nbi", A, x_true)
 
     print("Starting benchmark...")
 
