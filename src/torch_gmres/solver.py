@@ -64,10 +64,21 @@ def gmres(
     _b = b.contiguous()
     current_x = current_x.contiguous()
 
+    # Tolerance is constant across restarts; compute once
+    tolerance = atol + rtol * b_norm
+
+    # Reuse a zero-initialized buffer for x0 passed to CUDA kernel
+    zero_init = torch.zeros_like(_b)
+
+    # Initialize residuals to the initial residual norm (used if loop doesn't run)
+    _r0 = _b - torch.matmul(_A, current_x.unsqueeze(-1)).squeeze(-1)
+    actual_residuals = torch.linalg.norm(_r0, dim=1).to(real_dtype)
+
     i = 0
     while max_restarts is None or i < max_restarts:
         # r = b - A @ x for the current guess
-        r = _b - torch.einsum('bij,bj->bi', _A, current_x)
+        # Prefer batched matmul over einsum to reduce dispatch overhead
+        r = _b - torch.matmul(_A, current_x.unsqueeze(-1)).squeeze(-1)
 
         if verbose:
             print(f"Restart {i}, Max Iterations: {torch.max(total_iterations).item()}")
@@ -77,7 +88,7 @@ def gmres(
         # Therefore, the initial "guess" passed to the kernel should be a zero vector,
         # and the "b" vector should be the current residual "r".
         x_update, ks, residuals = torch_gmres_cuda.run_iterations(
-            _A, r, torch.zeros_like(r), m, rtol, atol
+            _A, r, zero_init, m, rtol, atol
         )
 
         current_x += x_update
@@ -87,7 +98,6 @@ def gmres(
         actual_residuals = torch.gather(residuals, 1, actual_indices).squeeze(1)
 
         # Check for convergence
-        tolerance = atol + rtol * b_norm
         if torch.all(actual_residuals <= tolerance):
             if verbose:
                 print(
