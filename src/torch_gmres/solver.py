@@ -2,8 +2,19 @@ import torch
 
 from torch_gmres import GMRESResult
 
-# This assumes your compiled module is named 'torch_gmres_cuda'
-from . import cuda as torch_gmres_cuda
+# Try to import the compiled CUDA extension. If unavailable, we'll fallback to
+# the pure-Python implementation so CPU-only environments can still import and
+# use this package (albeit much slower).
+try:  # pragma: no cover - environment dependent
+    from . import cuda as torch_gmres_cuda  # type: ignore
+    _HAS_CUDA_EXT = True
+except (ImportError, ModuleNotFoundError):  # pragma: no cover - no CUDA ext
+    torch_gmres_cuda = None  # type: ignore[assignment]
+    _HAS_CUDA_EXT = False
+    # Defer importing the Python reference implementation to runtime
+    _PY_SOLVER_AVAILABLE = True
+else:
+    _PY_SOLVER_AVAILABLE = True
 
 
 @torch.no_grad()
@@ -41,6 +52,14 @@ def gmres(
         GMRESResult: An object containing the solution, total iteration counts,
         and final residuals for each system in the batch.
     """
+    # Fallback path (no CUDA ext): delegate to the pure-Python implementation.
+    if not _HAS_CUDA_EXT:
+        from . import solver_python as _py_solver  # local import to avoid lints
+        return _py_solver.gmres(
+            A=A, b=b, x0=x0, m=m, rtol=rtol, atol=atol, max_restarts=max_restarts
+        )
+
+    # Fast path with CUDA extension
     if A.ndim == 2:
         A = A.unsqueeze(0)
     if b.ndim == 1:
@@ -53,8 +72,12 @@ def gmres(
     if A.device.type != "cuda" or b.device.type != "cuda":
         raise TypeError("Input tensors must be on a CUDA device.")
 
-    real_dtype = torch.float64 if A.dtype == torch.complex128 else torch.float32
-    b_norm = torch.linalg.norm(b, dim=1).to(real_dtype)
+    real_dtype = (
+        torch.float64 if A.dtype == torch.complex128 else torch.float32
+    )
+    # Compute L2 norm along dim=1 without relying on torch.linalg.* to
+    # satisfy strict static analysis in CPU-only environments.
+    b_norm = torch.sqrt(torch.sum(torch.abs(b) ** 2, dim=1)).to(real_dtype)
 
     current_x = torch.zeros_like(b) if x0 is None else x0.clone()
 
@@ -64,6 +87,10 @@ def gmres(
     _b = b.contiguous()
     current_x = current_x.contiguous()
 
+    # Pre-initialize in case the loop short-circuits before assignment.
+    actual_residuals = torch.full(
+        (B,), float("inf"), dtype=real_dtype, device=A.device
+    )
     i = 0
     while max_restarts is None or i < max_restarts:
         # r = b - A @ x for the current guess
@@ -76,6 +103,9 @@ def gmres(
         # not the full solution. It solves Ay=r for y, where x_new = x_old + y.
         # Therefore, the initial "guess" passed to the kernel should be a zero vector,
         # and the "b" vector should be the current residual "r".
+        # Ensure the optional CUDA extension is present at this point for type checkers
+        assert torch_gmres_cuda is not None
+        # type: ignore[union-attr] - optional runtime extension
         x_update, ks, residuals = torch_gmres_cuda.run_iterations(
             _A, r, torch.zeros_like(r), m, rtol, atol
         )

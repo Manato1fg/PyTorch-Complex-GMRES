@@ -5,7 +5,7 @@ from torch_gmres import GMRESResult
 
 class GMRESStepResult:
     """
-    Result dataclass for GMRES step.
+    Result dataclass or GMRES step.
 
     it is not a dataclass because it is used in torch.jit.script
     """
