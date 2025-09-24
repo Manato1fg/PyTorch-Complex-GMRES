@@ -1,84 +1,16 @@
-# manylinux_2_28 (AlmaLinux 8) based builder for CUDA-enabled wheels
-# Defaults: CUDA 12.6, Python 3.13 (cp313)
-# Usage example:
-#   docker build -f Dockerfile.manylinux \
-#     --build-arg CUDA_MAJOR_MINOR=12-6 \
-#     --build-arg PYTHON_ABIS="cp313" \
-#     -t torch-gmres-manylinux .
-#   docker run --rm -v $(pwd)/dist:/out torch-gmres-manylinux
-# The container will place repaired wheels in /out.
+FROM sameli/manylinux2014_x86_64_cuda_12.3:latest
 
-FROM quay.io/pypa/manylinux_2_28_x86_64 AS builder
+COPY . /workspace
 
-ARG CUDA_MAJOR_MINOR=12-6
-# Space-separated list of CPython ABI tags to build (e.g., "cp311 cp312 cp313")
-ARG PYTHON_ABIS="cp313"
-# Architectures to compile for (adjust to your target GPUs)
-ARG TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0"
-# PyTorch index for CUDA wheels (adjust if changing CUDA version)
-ARG PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cu126"
+WORKDIR /workspace
 
-ENV CUDA_HOME=/usr/local/cuda \
-    PATH=/usr/local/cuda/bin:$PATH \
-    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
-    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
-    FORCE_CUDA=1
+ENV TORCH_CUDA_ARCH_LIST="5.0;6.0;6.1;7.0;7.5;8.0;8.6+PTX"
 
-# 1) Install CUDA Toolkit (devel) from NVIDIA RHEL8 repo (compatible with AlmaLinux 8)
-#    We only need the toolkit (nvcc + headers); we avoid installing drivers.
-RUN dnf -y update \
- && dnf -y install dnf-plugins-core \
- && dnf -y config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo \
- && dnf -y module disable nvidia-driver \
- && dnf -y install cuda-toolkit-${CUDA_MAJOR_MINOR} \
- && dnf clean all && rm -rf /var/cache/dnf/*
+RUN mkdir -p /output && \
+    uv sync && uv run setup.py bdist_wheel --universal && \
+    cp dist/*.whl /output
 
-# 2) Install newer GCC toolset for CUDA 12.x compatibility (gcc-toolset-12)
-RUN dnf -y install gcc-toolset-12 \
- && dnf clean all && rm -rf /var/cache/dnf/*
+RUN rm -rf /workspace
 
-# Enable the newer GCC toolchain in PATH for all subsequent steps
-ENV PATH=/opt/rh/gcc-toolset-12/root/usr/bin:${PATH}
-
-# 3) Utilities
-RUN dnf -y install git which findutils \
- && dnf clean all && rm -rf /var/cache/dnf/*
-
-WORKDIR /io
-COPY . /io
-
-# 4) Build per Python ABI
-RUN mkdir -p /wheelhouse /out && \
-    for ABI in ${PYTHON_ABIS}; do \
-      for PYBIN in /opt/python/${ABI}-*/bin; do \
-        echo "Building for ${PYBIN}"; \
-        ${PYBIN}/python -m pip install --upgrade pip; \
-        ${PYBIN}/pip install --no-cache-dir wheel build setuptools ninja auditwheel; \
-        # Install PyTorch CUDA package
-        ${PYBIN}/pip install --no-cache-dir --index-url ${PYTORCH_INDEX_URL} torch; \
-        # Optional: runtime deps that might be needed at build time
-        ${PYBIN}/pip install --no-cache-dir prettytable; \
-        # Build wheel
-        CUDA_HOME=${CUDA_HOME} TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
-        ${PYBIN}/python -m build --wheel --outdir /tmp/wheels /io; \
-        # Repair wheels: exclude CUDA libs (provided by system / PyTorch at runtime)
-        for whl in /tmp/wheels/*.whl; do \
-          auditwheel repair \
-            --plat manylinux_2_28_x86_64 \
-            --exclude libcuda.so.1 \
-            --exclude libcudart.so \
-            --exclude libcudart.so.* \
-            --exclude libnvrtc.so \
-            --exclude libnvrtc.so.* \
-            --exclude libcublas.so \
-            --exclude libcublas.so.* \
-            --exclude libcublasLt.so \
-            --exclude libcublasLt.so.* \
-            -w /wheelhouse "$whl"; \
-        done; \
-        rm -rf /tmp/wheels; \
-      done; \
-    done
-
-# Default command copies output wheels to a mounted volume at /out (if provided)
-CMD bash -lc 'cp -v /wheelhouse/* /out/ 2>/dev/null || true; ls -l /wheelhouse'
+WORKDIR /output
+RUN ls -l /output
