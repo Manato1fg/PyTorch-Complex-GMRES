@@ -357,7 +357,7 @@ std::vector<torch::Tensor> gmres_launcher(
     }
 
     // --- Kernel Launch Configuration ---
-std::vector<torch::Tensor> gmres_launcher(
+    const int grid_size = static_cast<int>(B);
 
     AT_DISPATCH_COMPLEX_TYPES(A.scalar_type(), "gmres_launcher", [&] {
         using real_t = typename scalar_t::value_type;
