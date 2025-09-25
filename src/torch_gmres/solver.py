@@ -38,7 +38,8 @@ def gmres(
         b (torch.Tensor): The batched right-hand side vector of size (B, N).
         x0 (torch.Tensor, optional): An initial guess for the solution.
             Defaults to a zero vector.
-        m (int, optional): The restart cycle length (dimension of the Krylov subspace).
+        m (int, optional): The restart cycle length (dimension of the
+            Krylov subspace).
             Defaults to 50.
         rtol (float, optional): The relative tolerance for convergence.
             Defaults to 1e-5.
@@ -46,7 +47,8 @@ def gmres(
             Defaults to 1e-8.
         max_restarts (int, optional): The maximum number of restarts.
             If None, restarts until convergence. Defaults to None.
-        verbose (bool, optional): If True, prints restart progress. Defaults to False.
+        verbose (bool, optional): If True, prints restart progress.
+            Defaults to False.
 
     Returns:
         GMRESResult: An object containing the solution, total iteration counts,
@@ -54,9 +56,11 @@ def gmres(
     """
     # Fallback path (no CUDA ext): delegate to the pure-Python implementation.
     if not _HAS_CUDA_EXT:
-        from . import solver_python as _py_solver  # local import to avoid lints
+        # local import to avoid lints
+        from . import solver_python as _py_solver
         return _py_solver.gmres(
-            A=A, b=b, x0=x0, m=m, rtol=rtol, atol=atol, max_restarts=max_restarts
+            A=A, b=b, x0=x0, m=m, rtol=rtol, atol=atol,
+            max_restarts=max_restarts
         )
 
     # Fast path with CUDA extension
@@ -97,24 +101,35 @@ def gmres(
         r = _b - torch.einsum('bij,bj->bi', _A, current_x)
 
         if verbose:
-            print(f"Restart {i}, Max Iterations: {torch.max(total_iterations).item()}")
+            max_it = torch.max(total_iterations).item()
+            print(f"Restart {i}, Max Iterations: {max_it}")
 
-        # The CUDA kernel internally computes the solution update,
-        # not the full solution. It solves Ay=r for y, where x_new = x_old + y.
-        # Therefore, the initial "guess" passed to the kernel should be a zero vector,
-        # and the "b" vector should be the current residual "r".
-        # Ensure the optional CUDA extension is present at this point for type checkers
+        # The CUDA kernel internally computes the solution update, not the
+        # full solution. It solves Ay=r for y, where x_new = x_old + y.
+        # Therefore, the initial "guess" passed to the kernel should be a
+        # zero vector, and the "b" vector should be the current residual "r".
+        # Ensure the optional CUDA extension is present at this point for
+        # type checkers
         assert torch_gmres_cuda is not None
-        # type: ignore[union-attr] - optional runtime extension
-        x_update, ks, residuals = torch_gmres_cuda.run_iterations(
-            _A, r, torch.zeros_like(r), m, rtol, atol
-        )
+        run_hybrid = getattr(torch_gmres_cuda, "run_iterations_hybrid", None)
+        if run_hybrid is not None:
+            # type: ignore[call-arg]
+            x_update, ks, residuals = run_hybrid(
+                _A, r, torch.zeros_like(r), m, rtol, atol
+            )
+        else:
+            # type: ignore[union-attr]
+            x_update, ks, residuals = torch_gmres_cuda.run_iterations(
+                _A, r, torch.zeros_like(r), m, rtol, atol
+            )
 
         current_x += x_update
         total_iterations += ks
 
         actual_indices = ks.view(-1, 1).to(torch.int64)
-        actual_residuals = torch.gather(residuals, 1, actual_indices).squeeze(1)
+        actual_residuals = torch.gather(
+            residuals, 1, actual_indices
+        ).squeeze(1)
 
         # Check for convergence
         tolerance = atol + rtol * b_norm
