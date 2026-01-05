@@ -260,6 +260,9 @@ __global__ void gmres_iterations_kernel(
     __syncthreads();
     
     // Determine the number of iterations to use in the solution
+    // Loop behavior: for (k = 0; k < m; ++k)
+    // - If converged at iteration k: break with k at that value, use k+1 iterations
+    // - If loop completes: k increments to m after last iteration (k=m-1), use m iterations
     int k_final = k;
     bool converged = *converged_flag;
     int num_iterations;
@@ -268,7 +271,7 @@ __global__ void gmres_iterations_kernel(
         // Converged at iteration k_final, use k_final + 1 iterations
         num_iterations = k_final + 1;
     } else {
-        // Did not converge after m iterations
+        // Did not converge: k_final should be m when loop completes naturally
         num_iterations = (k_final >= m) ? m : k_final + 1;
     }
     

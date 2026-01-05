@@ -6,8 +6,6 @@ import torch_gmres.solver as solver
 import pytest
 import torch
 
-torch.cuda.is_available()
-
 # Skip the whole test module when CUDA is not available
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required for these tests"
