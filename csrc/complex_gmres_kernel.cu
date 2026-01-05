@@ -250,10 +250,20 @@ __global__ void gmres_iterations_kernel(
         }
     }
     __syncthreads();
-    int num_iterations = k + 1;
-    if (num_iterations > m) {
-        num_iterations = m;
+    
+    // Determine the number of iterations to use in the solution
+    int k_final = k;
+    bool converged = *converged_flag;
+    int num_iterations;
+    
+    if (converged) {
+        // Converged at iteration k_final, use k_final + 1 iterations
+        num_iterations = k_final + 1;
+    } else {
+        // Did not converge after m iterations
+        num_iterations = (k_final >= m) ? m : k_final + 1;
     }
+    
     if (tid == 0) {
         for (int i = num_iterations - 1; i >= 0; --i) {
             T sum = T(0.0, 0.0);
