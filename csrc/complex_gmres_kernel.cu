@@ -71,6 +71,11 @@ __device__ T_real norm_sq(int n, const T* v, void* shared_mem) {
 
 /**
  * @brief Executes one cycle of iterative computations for the GMRES method.
+ * 
+ * This kernel computes the solution update (delta) for one GMRES restart cycle.
+ * It solves A * delta = (b - A * x) for delta, where x is the current solution guess.
+ * The output x_out contains the update delta, which should be added to the current solution.
+ * 
  * @tparam T Complex type (c10::complex<float> or c10::complex<double>).
  * @tparam T_real Real type (float or double).
  */
@@ -144,8 +149,11 @@ __global__ void gmres_iterations_kernel(
     __syncthreads();
 
     if (beta < 1e-12) {
+        // Residual is already very small, no update needed
+        for (int i = tid; i < n; i += blockDim.x) {
+            x_out[i] = T(0.0, 0.0);
+        }
         if (tid == 0) {
-            for (int i = 0; i < n; ++i) x_out[i] = x[i];
             k_out[batch_idx] = 0;
         }
         return;
@@ -279,6 +287,8 @@ __global__ void gmres_iterations_kernel(
     }
     __syncthreads();
 
+    // Compute the solution update: x_out = V @ y
+    // This is the update delta that should be added to the current solution
     for (int i = tid; i < n; i += blockDim.x) {
         T sum = T(0.0, 0.0);
         for (int j = 0; j < num_iterations; ++j) {
