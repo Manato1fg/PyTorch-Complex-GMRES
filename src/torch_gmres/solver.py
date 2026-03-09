@@ -15,6 +15,7 @@ def gmres(
     rtol: float = 1e-5,
     atol: float = 1e-8,
     max_restarts: int | None = None,
+    trace: bool = False,
     verbose: bool = False,
 ) -> GMRESResult:
     """
@@ -35,6 +36,7 @@ def gmres(
             Defaults to 1e-8.
         max_restarts (int, optional): The maximum number of restarts.
             If None, restarts until convergence. Defaults to None.
+        trace (bool, optional): If True, stores the solution at each restart in the GMRESResult trace. Defaults to False.
         verbose (bool, optional): If True, prints restart progress. Defaults to False.
 
     Returns:
@@ -75,6 +77,9 @@ def gmres(
     actual_residuals = torch.linalg.norm(_r0, dim=1).to(real_dtype)
 
     i = 0
+    trace_list = []
+    if trace:
+        trace_list.append(current_x.clone().detach().cpu())
     while max_restarts is None or i < max_restarts:
         # r = b - A @ x for the current guess
         # Prefer batched matmul over einsum to reduce dispatch overhead
@@ -94,6 +99,9 @@ def gmres(
         current_x += x_update
         total_iterations += ks
 
+        if trace:
+            trace_list.append(current_x.clone().detach().cpu())
+
         actual_indices = ks.view(-1, 1).to(torch.int64)
         actual_residuals = torch.gather(residuals, 1, actual_indices).squeeze(1)
 
@@ -109,4 +117,5 @@ def gmres(
         solution=current_x.view(B, N),
         num_iterations=total_iterations,
         residuals=actual_residuals,
+        trace=trace_list if trace else None
     )
