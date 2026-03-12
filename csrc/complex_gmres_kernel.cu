@@ -53,10 +53,12 @@ __device__ inline T block_reduce_sum_complex(T val, T* shared_buf) {
     total_r = warp_reduce_sum_real<T_real>(total_r);
     total_i = warp_reduce_sum_real<T_real>(total_i);
 
+    // Broadcast result to all threads via shared memory
     if (tid == 0) {
-        return T(total_r, total_i);
+        shared_buf[0] = T(total_r, total_i);
     }
-    return T(0.0, 0.0);
+    __syncthreads();
+    return shared_buf[0];
 }
 
 /**
@@ -122,7 +124,13 @@ __device__ T_real norm_sq(int n, const T* v, void* shared_mem) {
         total = shared_val_real[tid];
     }
     total = warp_reduce_sum_real<T_real>(total);
-    return total;
+
+    // Broadcast result to all threads via shared memory
+    if (tid == 0) {
+        shared_val_real[0] = total;
+    }
+    __syncthreads();
+    return shared_val_real[0];
 }
 
 
@@ -188,23 +196,31 @@ __global__ void gmres_iterations_kernel(
     }
 
     // 0. Initialize: r = b - A @ x  (tile x into shared memory)
-    for (int i = tid; i < n; i += blockDim.x) {
-        T ax = T(0.0, 0.0);
-        for (int tile = 0; tile < n; tile += blockDim.x) {
-            int j = tile + threadIdx.x;
-            if (j < n) {
-                reduce_buffer[threadIdx.x] = x[j];
-            } else {
-                reduce_buffer[threadIdx.x] = T(0.0, 0.0);
+    {
+        int num_i_iters = (n + blockDim.x - 1) / blockDim.x;
+        for (int i_iter = 0; i_iter < num_i_iters; i_iter++) {
+            int i = tid + i_iter * blockDim.x;
+            T ax = T(0.0, 0.0);
+            for (int tile = 0; tile < n; tile += blockDim.x) {
+                int j = tile + threadIdx.x;
+                if (j < n) {
+                    reduce_buffer[threadIdx.x] = x[j];
+                } else {
+                    reduce_buffer[threadIdx.x] = T(0.0, 0.0);
+                }
+                __syncthreads();
+                if (i < n) {
+                    int tile_max = min(blockDim.x, n - tile);
+                    for (int t = 0; t < tile_max; ++t) {
+                        ax = ax + A[i * n + (tile + t)] * reduce_buffer[t];
+                    }
+                }
+                __syncthreads();
             }
-            __syncthreads();
-            int tile_max = min(blockDim.x, n - tile);
-            for (int t = 0; t < tile_max; ++t) {
-                ax = ax + A[i * n + (tile + t)] * reduce_buffer[t];
+            if (i < n) {
+                w[i] = b[i] - ax;
             }
-            __syncthreads();
         }
-        w[i] = b[i] - ax;
     }
     __syncthreads();
 
@@ -236,23 +252,31 @@ __global__ void gmres_iterations_kernel(
     int k;
     for (k = 0; k < m; ++k) {
         // Matrix-vector product: w = A @ v_k  (tile v_k into shared memory)
-        for (int i = tid; i < n; i += blockDim.x) {
-            T aw = T(0.0, 0.0);
-            for (int tile = 0; tile < n; tile += blockDim.x) {
-                int j = tile + threadIdx.x;
-                if (j < n) {
-                    reduce_buffer[threadIdx.x] = V[k * n + j];
-                } else {
-                    reduce_buffer[threadIdx.x] = T(0.0, 0.0);
+        {
+            int num_i_iters = (n + blockDim.x - 1) / blockDim.x;
+            for (int i_iter = 0; i_iter < num_i_iters; i_iter++) {
+                int i = tid + i_iter * blockDim.x;
+                T aw = T(0.0, 0.0);
+                for (int tile = 0; tile < n; tile += blockDim.x) {
+                    int j = tile + threadIdx.x;
+                    if (j < n) {
+                        reduce_buffer[threadIdx.x] = V[k * n + j];
+                    } else {
+                        reduce_buffer[threadIdx.x] = T(0.0, 0.0);
+                    }
+                    __syncthreads();
+                    if (i < n) {
+                        int tile_max = min(blockDim.x, n - tile);
+                        for (int t = 0; t < tile_max; ++t) {
+                            aw = aw + A[i * n + (tile + t)] * reduce_buffer[t];
+                        }
+                    }
+                    __syncthreads();
                 }
-                __syncthreads();
-                int tile_max = min(blockDim.x, n - tile);
-                for (int t = 0; t < tile_max; ++t) {
-                    aw = aw + A[i * n + (tile + t)] * reduce_buffer[t];
+                if (i < n) {
+                    w[i] = aw;
                 }
-                __syncthreads();
             }
-            w[i] = aw;
         }
         __syncthreads();
 
@@ -454,6 +478,11 @@ std::vector<torch::Tensor> gmres_launcher(
             use_shared_memory
         );
     });
+
+    // Synchronize and check for kernel errors
+    auto err = cudaDeviceSynchronize();
+    TORCH_CHECK(err == cudaSuccess,
+        "GMRES kernel failed: ", cudaGetErrorString(err));
 
     return {x_out, k_out, residuals_out};
 }
