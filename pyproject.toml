@@ -3,18 +3,18 @@ name = "torch-gmres"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
     "prettytable>=3.16.0",
-    "torch>=2.7.1",
+    "torch==2.7.1",
 ]
 
 [project.optional-dependencies]
 cpu = [
-  "torch>=2.5.1",
+  "torch>=2.7.1",
 ]
 cu126 = [
-  "torch>=2.5.1",
+  "torch==2.7.1",
 ]
 
 [tool.uv]

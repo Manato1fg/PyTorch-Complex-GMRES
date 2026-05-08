@@ -14,7 +14,7 @@ ARG CUDA_MAJOR_MINOR=12-6
 # Space-separated list of CPython ABI tags to build (e.g., "cp311 cp312 cp313")
 ARG PYTHON_ABIS="cp313"
 # Architectures to compile for (adjust to your target GPUs)
-ARG TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0"
+ARG TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"
 # PyTorch index for CUDA wheels (adjust if changing CUDA version)
 ARG PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cu126"
 
@@ -22,7 +22,8 @@ ENV CUDA_HOME=/usr/local/cuda \
     PATH=/usr/local/cuda/bin:$PATH \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
     TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
-    FORCE_CUDA=1
+  FORCE_CUDA=1 \
+  PIP_ROOT_USER_ACTION=ignore
 
 # 1) Install CUDA Toolkit (devel) from NVIDIA RHEL8 repo (compatible with AlmaLinux 8)
 #    We only need the toolkit (nvcc + headers); we avoid installing drivers.
@@ -33,12 +34,24 @@ RUN dnf -y update \
  && dnf -y install cuda-toolkit-${CUDA_MAJOR_MINOR} \
  && dnf clean all && rm -rf /var/cache/dnf/*
 
-# 2) Install newer GCC toolset for CUDA 12.x compatibility (gcc-toolset-12)
+# 2) Install gcc-toolset-12 for CUDA 12.x compatibility (g++ < 14)
 RUN dnf -y install gcc-toolset-12 \
  && dnf clean all && rm -rf /var/cache/dnf/*
 
-# Enable the newer GCC toolchain in PATH for all subsequent steps
-ENV PATH=/opt/rh/gcc-toolset-12/root/usr/bin:${PATH}
+# PyPAのデフォルトコンパイラと同様に libstdc++ を静的リンクさせるラッパーを作成
+RUN mkdir -p /opt/custom_gcc && \
+    echo '#!/bin/bash' > /opt/custom_gcc/gcc && \
+    echo 'exec /opt/rh/gcc-toolset-12/root/usr/bin/gcc "$@"' >> /opt/custom_gcc/gcc && \
+    echo '#!/bin/bash' > /opt/custom_gcc/g++ && \
+    echo 'exec /opt/rh/gcc-toolset-12/root/usr/bin/g++ "$@" -static-libstdc++ -static-libgcc' >> /opt/custom_gcc/g++ && \
+    echo '#!/bin/bash' > /opt/custom_gcc/c++ && \
+    echo 'exec /opt/rh/gcc-toolset-12/root/usr/bin/c++ "$@" -static-libstdc++ -static-libgcc' >> /opt/custom_gcc/c++ && \
+    chmod +x /opt/custom_gcc/*
+
+# ラッパーを最優先で PATH に追加し、CC と CXX を明示
+ENV PATH=/opt/custom_gcc:/opt/rh/gcc-toolset-12/root/usr/bin:${PATH} \
+    CC=/opt/custom_gcc/gcc \
+    CXX=/opt/custom_gcc/g++
 
 # 3) Utilities
 RUN dnf -y install git which findutils \
@@ -51,19 +64,27 @@ COPY . /io
 RUN mkdir -p /wheelhouse /out && \
     for ABI in ${PYTHON_ABIS}; do \
       for PYBIN in /opt/python/${ABI}-*/bin; do \
+        export PATH=${PYBIN}:$PATH; \
         echo "Building for ${PYBIN}"; \
         ${PYBIN}/python -m pip install --upgrade pip; \
         ${PYBIN}/pip install --no-cache-dir wheel build setuptools ninja auditwheel; \
         # Install PyTorch CUDA package
-        ${PYBIN}/pip install --no-cache-dir --index-url ${PYTORCH_INDEX_URL} torch; \
+        ${PYBIN}/pip install --no-cache-dir --index-url ${PYTORCH_INDEX_URL} torch==2.7.1; \
         # Optional: runtime deps that might be needed at build time
         ${PYBIN}/pip install --no-cache-dir prettytable; \
-        # Build wheel
+        # Build wheel without isolation so setup.py can import torch from this interpreter
         CUDA_HOME=${CUDA_HOME} TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
-        ${PYBIN}/python -m build --wheel --outdir /tmp/wheels /io; \
-        # Repair wheels: exclude CUDA libs (provided by system / PyTorch at runtime)
+        ${PYBIN}/python -m build --wheel --no-isolation --outdir /tmp/wheels /io; \
+        if ! ls /tmp/wheels/*.whl >/dev/null 2>&1; then \
+          echo "No wheel produced for ${PYBIN}"; \
+          exit 1; \
+        fi; \
+       # 1. PyTorchのライブラリディレクトリのパスを取得する
+        TORCH_LIB=$(${PYBIN}/python -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))'); \
+        
+        # 2. LD_LIBRARY_PATH に TORCH_LIB を追加しつつ、PyTorch関連のライブラリを exclude する
         for whl in /tmp/wheels/*.whl; do \
-          auditwheel repair \
+          LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH}" auditwheel repair \
             --plat manylinux_2_28_x86_64 \
             --exclude libcuda.so.1 \
             --exclude libcudart.so \
@@ -74,6 +95,14 @@ RUN mkdir -p /wheelhouse /out && \
             --exclude libcublas.so.* \
             --exclude libcublasLt.so \
             --exclude libcublasLt.so.* \
+            --exclude libc10.so \
+            --exclude libc10.so.* \
+            --exclude libc10_cuda.so \
+            --exclude libc10_cuda.so.* \
+            --exclude libtorch.so \
+            --exclude libtorch_cpu.so \
+            --exclude libtorch_cuda.so \
+            --exclude libtorch_python.so \
             -w /wheelhouse "$whl"; \
         done; \
         rm -rf /tmp/wheels; \

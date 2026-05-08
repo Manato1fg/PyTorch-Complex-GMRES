@@ -37,3 +37,30 @@ To use this library, you need a PyTorch installation with CUDA support and the C
     ```bash
     uv run setup.py install
     ```
+
+### Build manylinux wheels with Docker
+
+`Dockerfile.manylinux` builds CUDA-enabled manylinux wheels in an isolated environment.
+
+1.  **Build the Docker image:**
+    ```bash
+    docker build -f Dockerfile.manylinux \
+      --build-arg CUDA_MAJOR_MINOR=12-6 \
+      --build-arg PYTHON_ABIS="cp313" \
+      -t torch-gmres-manylinux .
+    ```
+
+2.  **Run the container and export wheels:**
+    ```bash
+    mkdir -p dist
+    docker run --rm -v "$(pwd)/dist:/out" torch-gmres-manylinux
+    ```
+
+Generated wheels will be copied to `dist/` on the host.
+
+Useful build arguments:
+
+* `PYTHON_ABIS`: Space-separated CPython ABI tags (example: `"cp311 cp312 cp313"`).
+* `CUDA_MAJOR_MINOR`: CUDA toolkit version to install (example: `12-6`).
+* `TORCH_CUDA_ARCH_LIST`: GPU architectures to compile for.
+* `PYTORCH_INDEX_URL`: PyTorch wheel index URL matching your CUDA version.
