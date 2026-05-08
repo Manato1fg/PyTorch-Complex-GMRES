@@ -1,14 +1,6 @@
-# manylinux_2_28 (AlmaLinux 8) based builder for CUDA-enabled wheels
-# Defaults: CUDA 12.6, Python 3.13 (cp313)
-# Usage example:
-#   docker build -f Dockerfile.manylinux \
-#     --build-arg CUDA_MAJOR_MINOR=12-6 \
-#     --build-arg PYTHON_ABIS="cp313" \
-#     -t torch-gmres-manylinux .
-#   docker run --rm -v $(pwd)/dist:/out torch-gmres-manylinux
-# The container will place repaired wheels in /out.
+FROM sameli/manylinux2014_x86_64_cuda_12.3:latest
 
-FROM quay.io/pypa/manylinux_2_28_x86_64 AS builder
+COPY . /workspace
 
 ARG CUDA_MAJOR_MINOR=12-6
 # Space-separated list of CPython ABI tags to build (e.g., "cp311 cp312 cp313")
@@ -25,14 +17,9 @@ ENV CUDA_HOME=/usr/local/cuda \
   FORCE_CUDA=1 \
   PIP_ROOT_USER_ACTION=ignore
 
-# 1) Install CUDA Toolkit (devel) from NVIDIA RHEL8 repo (compatible with AlmaLinux 8)
-#    We only need the toolkit (nvcc + headers); we avoid installing drivers.
-RUN dnf -y update \
- && dnf -y install dnf-plugins-core \
- && dnf -y config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo \
- && dnf -y module disable nvidia-driver \
- && dnf -y install cuda-toolkit-${CUDA_MAJOR_MINOR} \
- && dnf clean all && rm -rf /var/cache/dnf/*
+RUN mkdir -p /output && \
+    uv sync && uv run setup.py bdist_wheel --universal && \
+    cp dist/*.whl /output
 
 # 2) Install gcc-toolset-12 for CUDA 12.x compatibility (g++ < 14)
 RUN dnf -y install gcc-toolset-12 \

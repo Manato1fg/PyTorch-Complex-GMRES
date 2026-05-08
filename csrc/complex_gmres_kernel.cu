@@ -136,6 +136,11 @@ __device__ T_real norm_sq(int n, const T* v, void* shared_mem) {
 
 /**
  * @brief Executes one cycle of iterative computations for the GMRES method.
+ * 
+ * This kernel computes the solution update (delta) for one GMRES restart cycle.
+ * It solves A * delta = (b - A * x) for delta, where x is the current solution guess.
+ * The output x_out contains the update delta, which should be added to the current solution.
+ * 
  * @tparam T Complex type (c10::complex<float> or c10::complex<double>).
  * @tparam T_real Real type (float or double).
  */
@@ -228,8 +233,11 @@ __global__ void gmres_iterations_kernel(
     __syncthreads();
 
     if (beta < 1e-12) {
+        // Residual is already very small, no update needed
+        for (int i = tid; i < n; i += blockDim.x) {
+            x_out[i] = T(0.0, 0.0);
+        }
         if (tid == 0) {
-            for (int i = 0; i < n; ++i) x_out[i] = x[i];
             k_out[batch_idx] = 0;
         }
         return;
@@ -353,10 +361,23 @@ __global__ void gmres_iterations_kernel(
         }
     }
     __syncthreads();
-    int num_iterations = k + 1;
-    if (num_iterations > m) {
-        num_iterations = m;
+    
+    // Determine the number of iterations to use in the solution
+    // Loop behavior: for (k = 0; k < m; ++k)
+    // - If converged at iteration k: break with k at that value, use k+1 iterations
+    // - If loop completes: k increments to m after last iteration (k=m-1), use m iterations
+    int k_final = k;
+    bool converged = *converged_flag;
+    int num_iterations;
+    
+    if (converged) {
+        // Converged at iteration k_final, use k_final + 1 iterations
+        num_iterations = k_final + 1;
+    } else {
+        // Did not converge: k_final should be m when loop completes naturally
+        num_iterations = (k_final >= m) ? m : k_final + 1;
     }
+    
     if (tid == 0) {
         for (int i = num_iterations - 1; i >= 0; --i) {
             T sum = T(0.0, 0.0);
@@ -372,6 +393,8 @@ __global__ void gmres_iterations_kernel(
     }
     __syncthreads();
 
+    // Compute the solution update: x_out = V @ y
+    // This is the update delta that should be added to the current solution
     for (int i = tid; i < n; i += blockDim.x) {
         T sum = T(0.0, 0.0);
         for (int j = 0; j < num_iterations; ++j) {
@@ -459,7 +482,7 @@ std::vector<torch::Tensor> gmres_launcher(
     }
 
     // --- Kernel Launch Configuration ---
-    const int grid_size = B;
+    const int grid_size = static_cast<int>(B);
 
     AT_DISPATCH_COMPLEX_TYPES(A.scalar_type(), "gmres_launcher", [&] {
         using real_t = typename scalar_t::value_type;
@@ -487,6 +510,169 @@ std::vector<torch::Tensor> gmres_launcher(
     return {x_out, k_out, residuals_out};
 }
 
+// --------------------------
+// Hybrid (cuBLAS/ATen) GMRES
+// --------------------------
+#include <ATen/ops/matmul.h>
+#include <ATen/ops/conj_physical.h>
+#include <ATen/ops/sum.h>
+#include <ATen/ops/zeros.h>
+#include <ATen/ops/zeros_like.h>
+#include <ATen/ops/empty.h>
+#include <ATen/ops/norm.h>
+#include <ATen/ops/logical_and.h>
+#include <ATen/ops/where.h>
+#include <ATen/ops/abs.h>
+#include <ATen/ops/unsqueeze.h>
+#include <ATen/ops/squeeze.h>
+#include <ATen/ops/stack.h>
+#include <ATen/ops/linalg_solve_triangular.h>
+
+static inline torch::Tensor _real_like_from_complex(const torch::Tensor& t) {
+    auto dtype = t.scalar_type() == torch::kComplexFloat ? torch::kFloat32 : torch::kFloat64;
+    return torch::empty(t.sizes(), t.options().dtype(dtype));
+}
+
+std::vector<torch::Tensor> gmres_launcher_hybrid(
+    torch::Tensor A, torch::Tensor b, torch::Tensor x0,
+    int m, double rtol, double atol)
+{
+    TORCH_CHECK(A.is_cuda() && b.is_cuda() && x0.is_cuda(), "Inputs must be CUDA tensors");
+    TORCH_CHECK(A.is_complex() && b.is_complex() && x0.is_complex(), "Only complex dtypes supported");
+
+    // Ensure shapes: (B,N,N), (B,N), (B,N)
+    if (A.dim() == 2) A = A.unsqueeze(0);
+    if (b.dim() == 1) b = b.unsqueeze(0);
+    if (x0.dim() == 1) x0 = x0.unsqueeze(0);
+
+    const auto B = A.size(0);
+    const auto N = A.size(1);
+    auto optsC = A.options();
+
+    // r = b - A @ x0
+    auto x0_3 = x0.unsqueeze(-1);            // (B,N,1)
+    auto Ax   = at::matmul(A, x0_3).squeeze(-1); // (B,N)
+    auto r    = b - Ax;                      // (B,N)
+
+    // beta = ||r||_2 per batch
+    auto beta = at::norm(r, 2, /*dim=*/-1);  // (B)
+
+    // Early exit: if beta is ~0
+    auto x_out = x0.clone();
+    auto k_out = torch::zeros({B}, optsC.dtype(torch::kInt));
+    auto residuals = torch::zeros({B, m + 1}, optsC.dtype(A.scalar_type() == torch::kComplexFloat ? torch::kFloat : torch::kDouble));
+
+    // Initialize V, H, c, s, e1
+    auto V = torch::zeros({B, N, m + 1}, optsC);
+    auto H = torch::zeros({B, m + 1, m}, optsC);
+    auto c = torch::zeros({B, m}, optsC);
+    auto s = torch::zeros({B, m}, optsC);
+    auto e1 = torch::zeros({B, m + 1}, optsC);
+
+    // e1[:,0] = beta; V[:,:,0] = r / beta
+    e1.index_put_({torch::indexing::Slice(), 0}, beta); // complex broadcast OK (real -> complex upcast)
+    auto beta_unsq = beta.unsqueeze(-1); // (B,1)
+    // Avoid div by zero
+    auto mask_nz = beta_unsq.abs() > 1e-12;
+    auto safe_beta = torch::where(mask_nz, beta_unsq, torch::ones_like(beta_unsq));
+    V.index_put_({torch::indexing::Slice(), torch::indexing::Slice(), 0}, r / safe_beta);
+
+    // Store residual[0] = beta (real)
+    residuals.index_put_({torch::indexing::Slice(), 0}, beta.to(residuals.dtype()));
+
+    auto real_tol = atol + rtol * beta; // (B)
+
+    // GMRES iterations
+    int k_reached = 0;
+    for (int k = 0; k < m; ++k) {
+        k_reached = k + 1;
+        // w = A @ v_k
+        auto v_k = V.index({torch::indexing::Slice(), torch::indexing::Slice(), k}).unsqueeze(-1); // (B,N,1)
+        auto w = at::matmul(A, v_k).squeeze(-1); // (B,N)
+
+        // Modified Gram-Schmidt
+        for (int j = 0; j <= k; ++j) {
+            auto v_j = V.index({torch::indexing::Slice(), torch::indexing::Slice(), j}); // (B,N)
+            auto h_jk = (at::conj_physical(v_j) * w).sum(-1); // (B)
+            // H[:, j, k] = h_jk
+            H.index_put_({torch::indexing::Slice(), j, k}, h_jk);
+            // w -= h_jk[:,None] * v_j
+            w = w - h_jk.unsqueeze(-1) * v_j;
+        }
+
+        auto h_k1k = at::norm(w, 2, /*dim=*/-1); // (B)
+        H.index_put_({torch::indexing::Slice(), k + 1, k}, h_k1k.to(A.dtype()));
+
+        auto h_mask = h_k1k.abs() > 1e-12;
+        auto safe_h = torch::where(h_mask, h_k1k, torch::ones_like(h_k1k));
+        auto v_next = w / safe_h.unsqueeze(-1); // (B,N)
+        V.index_put_({torch::indexing::Slice(), torch::indexing::Slice(), k + 1}, v_next);
+
+        // Apply previous Givens and compute new one (batched,要素毎演算)
+        // 1) Apply previous rotations to H[:, :, k]
+        for (int j = 0; j < k; ++j) {
+            auto h_ik  = H.index({torch::indexing::Slice(), j,     k});
+            auto h_i1k = H.index({torch::indexing::Slice(), j + 1, k});
+            auto cj = c.index({torch::indexing::Slice(), j});
+            auto sj = s.index({torch::indexing::Slice(), j});
+            auto h_ik_new  = at::conj_physical(cj) * h_ik + at::conj_physical(sj) * h_i1k;
+            auto h_i1k_new = -sj * h_ik + cj * h_i1k;
+            H.index_put_({torch::indexing::Slice(), j,     k}, h_ik_new);
+            H.index_put_({torch::indexing::Slice(), j + 1, k}, h_i1k_new);
+        }
+        // 2) New Givens (from H[k,k], H[k+1,k])
+        auto Hkk   = H.index({torch::indexing::Slice(), k,     k});
+        auto Hk1k  = H.index({torch::indexing::Slice(), k + 1, k});
+        auto nrm = (at::abs(Hkk) * at::abs(Hkk) + at::abs(Hk1k) * at::abs(Hk1k)).sqrt(); // real (B)
+        auto nz = nrm > 1e-12;
+        auto c_new = torch::where(nz, Hkk / nrm.to(A.dtype()), torch::ones_like(Hkk));
+        auto s_new = torch::where(nz, Hk1k / nrm.to(A.dtype()), torch::zeros_like(Hk1k));
+        c.index_put_({torch::indexing::Slice(), k}, c_new);
+        s.index_put_({torch::indexing::Slice(), k}, s_new);
+
+        // Apply to H and e1
+        Hkk  = at::conj_physical(c_new) * Hkk + at::conj_physical(s_new) * Hk1k;
+        Hk1k = Hkk * 0; // set to 0
+        H.index_put_({torch::indexing::Slice(), k,     k}, Hkk);
+        H.index_put_({torch::indexing::Slice(), k + 1, k}, Hk1k);
+
+        auto e1k  = e1.index({torch::indexing::Slice(), k});
+        auto e1k1 = e1.index({torch::indexing::Slice(), k + 1});
+        auto e1k_new  = at::conj_physical(c_new) * e1k + at::conj_physical(s_new) * e1k1;
+        auto e1k1_new = -s_new * e1k + c_new * e1k1;
+        e1.index_put_({torch::indexing::Slice(), k},     e1k_new);
+        e1.index_put_({torch::indexing::Slice(), k + 1}, e1k1_new);
+
+        // residual[k+1] = |e1[k+1]|
+        auto res = at::abs(e1k1_new); // real (B)
+        residuals.index_put_({torch::indexing::Slice(), k + 1}, res.to(residuals.dtype()));
+
+        // Convergence check: res <= atol + rtol*beta
+        auto tolk = real_tol; // constant per restart
+        auto done_mask = (res <= tolk);
+        // If all true, break
+        if (done_mask.all().item<bool>()) {
+            break;
+        }
+    }
+
+    // Solve least squares (upper-triangular) and form x_update
+    int K = std::min(m, k_reached);
+    if (K == 0) {
+        auto x_update = torch::zeros_like(b);
+        return {x_update, k_out, residuals};
+    }
+    auto Htri = H.index({torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, K), torch::indexing::Slice(torch::indexing::None, K)}); // (B,K,K)
+    auto rhs  = e1.index({torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, K)}).unsqueeze(-1); // (B,K,1)
+    auto y    = at::linalg_solve_triangular(Htri, rhs, /*upper=*/true); // (B,K,1)
+    auto x_update = at::matmul(V.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(torch::indexing::None, K)}), y).squeeze(-1); // (B,N)
+
+    // iterations per batch = K (vector int)
+    k_out.fill_(K);
+    return {x_update, k_out, residuals};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run_iterations", &gmres_launcher, "Run one cycle of GMRES iterations on CUDA");
+    m.def("run_iterations_hybrid", &gmres_launcher_hybrid, "Run GMRES using cuBLAS/ATen ops with small GPU-side updates");
 }
