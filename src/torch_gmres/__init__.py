@@ -11,3 +11,4 @@ class GMRESResult:
     solution: torch.Tensor
     num_iterations: torch.Tensor
     residuals: torch.Tensor
+    trace: list[torch.Tensor] | None = None

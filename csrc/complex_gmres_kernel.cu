@@ -9,19 +9,56 @@
  * @param shared_val A pointer to the shared memory used for reduction.
  * @return The total sum, returned by thread 0.
  */
-template <typename T>
-__device__ T block_reduce_sum(T val, T* shared_val) {
+// Warp-level reduction for real values
+template <typename T_real>
+__device__ inline T_real warp_reduce_sum_real(T_real val) {
+    unsigned mask = 0xffffffffu;
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(mask, val, offset);
+    }
+    return val;
+}
+
+// Block-level reduction for complex values using warp shuffles.
+// Returns the total sum in thread 0 of the block.
+template <typename T, typename T_real>
+__device__ inline T block_reduce_sum_complex(T val, T* shared_buf) {
     int tid = threadIdx.x;
-    shared_val[tid] = val;
+    int lane = tid & (warpSize - 1);
+    int warpId = tid >> 5; // 32 threads per warp
+
+    T_real real = val.real();
+    T_real imag = val.imag();
+
+    // Intra-warp reduce
+    real = warp_reduce_sum_real<T_real>(real);
+    imag = warp_reduce_sum_real<T_real>(imag);
+
+    // Write warp result to shared memory
+    if (lane == 0) {
+        shared_buf[warpId] = T(real, imag);
+    }
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            shared_val[tid] = shared_val[tid] + shared_val[tid + s];
-        }
-        __syncthreads();
+    // Reduce warp results by the first warp
+    T total(0.0, 0.0);
+    int numWarps = (blockDim.x + warpSize - 1) / warpSize;
+    if (tid < numWarps) {
+        total = shared_buf[tid];
     }
-    return shared_val[0];
+
+    // Final warp reduction
+    T_real total_r = total.real();
+    T_real total_i = total.imag();
+    total_r = warp_reduce_sum_real<T_real>(total_r);
+    total_i = warp_reduce_sum_real<T_real>(total_i);
+
+    // Broadcast result to all threads via shared memory
+    if (tid == 0) {
+        shared_buf[0] = T(total_r, total_i);
+    }
+    __syncthreads();
+    return shared_buf[0];
 }
 
 /**
@@ -59,13 +96,41 @@ __device__ T_real hypot(const T v1, const T v2) {
  */
 template <typename T, typename T_real>
 __device__ T_real norm_sq(int n, const T* v, void* shared_mem) {
+    // Use warp-level then block-level reduction for real values.
     T_real* shared_val_real = reinterpret_cast<T_real*>(shared_mem);
+    int tid = threadIdx.x;
+    int lane = tid & (warpSize - 1);
+    int warpId = tid >> 5;
+
     T_real thread_sum = 0.0;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         T val = v[i];
         thread_sum += val.real() * val.real() + val.imag() * val.imag();
     }
-    return block_reduce_sum_real<T_real>(thread_sum, shared_val_real);
+
+    // Intra-warp reduce
+    thread_sum = warp_reduce_sum_real<T_real>(thread_sum);
+
+    // Write warp partial to shared mem
+    if (lane == 0) {
+        shared_val_real[warpId] = thread_sum;
+    }
+    __syncthreads();
+
+    // Final reduce by first warp
+    T_real total = 0.0;
+    int numWarps = (blockDim.x + warpSize - 1) / warpSize;
+    if (tid < numWarps) {
+        total = shared_val_real[tid];
+    }
+    total = warp_reduce_sum_real<T_real>(total);
+
+    // Broadcast result to all threads via shared memory
+    if (tid == 0) {
+        shared_val_real[0] = total;
+    }
+    __syncthreads();
+    return shared_val_real[0];
 }
 
 
@@ -135,13 +200,32 @@ __global__ void gmres_iterations_kernel(
         y = y_global + batch_idx * m;
     }
 
-    // 0. Initialize: r = b - A @ x
-    for (int i = tid; i < n; i += blockDim.x) {
-        T ax = T(0.0, 0.0);
-        for (int j = 0; j < n; ++j) {
-            ax = ax + A[i * n + j] * x[j];
+    // 0. Initialize: r = b - A @ x  (tile x into shared memory)
+    {
+        int num_i_iters = (n + blockDim.x - 1) / blockDim.x;
+        for (int i_iter = 0; i_iter < num_i_iters; i_iter++) {
+            int i = tid + i_iter * blockDim.x;
+            T ax = T(0.0, 0.0);
+            for (int tile = 0; tile < n; tile += blockDim.x) {
+                int j = tile + threadIdx.x;
+                if (j < n) {
+                    reduce_buffer[threadIdx.x] = x[j];
+                } else {
+                    reduce_buffer[threadIdx.x] = T(0.0, 0.0);
+                }
+                __syncthreads();
+                if (i < n) {
+                    int tile_max = min(blockDim.x, n - tile);
+                    for (int t = 0; t < tile_max; ++t) {
+                        ax = ax + A[i * n + (tile + t)] * reduce_buffer[t];
+                    }
+                }
+                __syncthreads();
+            }
+            if (i < n) {
+                w[i] = b[i] - ax;
+            }
         }
-        w[i] = b[i] - ax;
     }
     __syncthreads();
 
@@ -175,13 +259,32 @@ __global__ void gmres_iterations_kernel(
     // 1. GMRES Main Loop (Arnoldi Iteration)
     int k;
     for (k = 0; k < m; ++k) {
-        // Matrix-vector product: w = A @ v_k
-        for (int i = tid; i < n; i += blockDim.x) {
-            T aw = T(0.0, 0.0);
-            for (int j = 0; j < n; ++j) {
-                aw = aw + A[i * n + j] * V[k * n + j];
+        // Matrix-vector product: w = A @ v_k  (tile v_k into shared memory)
+        {
+            int num_i_iters = (n + blockDim.x - 1) / blockDim.x;
+            for (int i_iter = 0; i_iter < num_i_iters; i_iter++) {
+                int i = tid + i_iter * blockDim.x;
+                T aw = T(0.0, 0.0);
+                for (int tile = 0; tile < n; tile += blockDim.x) {
+                    int j = tile + threadIdx.x;
+                    if (j < n) {
+                        reduce_buffer[threadIdx.x] = V[k * n + j];
+                    } else {
+                        reduce_buffer[threadIdx.x] = T(0.0, 0.0);
+                    }
+                    __syncthreads();
+                    if (i < n) {
+                        int tile_max = min(blockDim.x, n - tile);
+                        for (int t = 0; t < tile_max; ++t) {
+                            aw = aw + A[i * n + (tile + t)] * reduce_buffer[t];
+                        }
+                    }
+                    __syncthreads();
+                }
+                if (i < n) {
+                    w[i] = aw;
+                }
             }
-            w[i] = aw;
         }
         __syncthreads();
 
@@ -191,7 +294,7 @@ __global__ void gmres_iterations_kernel(
             for (int i = tid; i < n; i += blockDim.x) {
                 thread_sum = thread_sum + w[i] * std::conj(V[j * n + i]);
             }
-            T h_jk = block_reduce_sum<T>(thread_sum, reduce_buffer);
+            T h_jk = block_reduce_sum_complex<T, T_real>(thread_sum, reduce_buffer);
             __syncthreads();
             if (tid == 0) H[j * m + k] = h_jk;
             __syncthreads();
@@ -370,13 +473,12 @@ std::vector<torch::Tensor> gmres_launcher(
         size_t smem_for_reduce_flag = align_size(smem_reduce_size, alignof(bool)) + sizeof(bool);
         launch_smem_size = smem_for_reduce_flag;
         
-        // Allocate global memory for H, c, s, e1, y
+    // Allocate global memory for H, c, s, e1, y
         H_global = torch::empty({B, (m + 1) * m}, options);
         c_global = torch::empty({B, m}, options);
         s_global = torch::empty({B, m}, options);
         e1_global = torch::empty({B, m + 1}, options);
-        // y is a vector of length m per batch
-        y_global = torch::empty({B, m}, options);
+    y_global = torch::empty({B, m}, options);
     }
 
     // --- Kernel Launch Configuration ---
@@ -399,6 +501,11 @@ std::vector<torch::Tensor> gmres_launcher(
             use_shared_memory
         );
     });
+
+    // Synchronize and check for kernel errors
+    auto err = cudaDeviceSynchronize();
+    TORCH_CHECK(err == cudaSuccess,
+        "GMRES kernel failed: ", cudaGetErrorString(err));
 
     return {x_out, k_out, residuals_out};
 }

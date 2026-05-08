@@ -14,7 +14,7 @@ if __name__ == "__main__":
                         help="Batch size for the linear systems.")
     parser.add_argument("--matrix_size", "-ms", type=int, default=100,
                         help="Size of the square matrix A.")
-    parser.add_argument("--num_trials", "-nt",  type=int, default=5,
+    parser.add_argument("--num_trials", "-nt",  type=int, default=10,
                         help="Number of trials for benchmarking.")
     parser.add_argument("--m", "-m", type=int, default=50,
                         help="Restart cycle length (dimension of Krylov subspace).")
@@ -58,11 +58,15 @@ if __name__ == "__main__":
     print(f"Batch size: {batch_size}, Matrix size: {matrix_size}, Trials: {num_trials}")
 
     print("Running GMRES with custom CUDA kernel...")
+    # Warm-up to exclude one-time JIT/initialization overhead
+    _ = solver.gmres(A[0], b[0], x0=None, m=m, rtol=rtol, atol=atol)
+    torch.cuda.synchronize()
     # Benchmark the solver with CUDA kernel
     solver_results = []
     for i in range(num_trials):
         start_time = time.time()
         result = solver.gmres(A[i], b[i], x0=None, m=m, rtol=rtol, atol=atol)
+        torch.cuda.synchronize()
         elapsed_time = time.time() - start_time
         solver_results.append({
             "num_iterations": result.num_iterations.tolist(),
@@ -71,11 +75,14 @@ if __name__ == "__main__":
         })
 
     print("Running GMRES with Python implementation...")
+    _ = solver_python.gmres(A[0], b[0], x0=None, m=m, rtol=rtol, atol=atol)
+    torch.cuda.synchronize()
     # Benchmark the solver with Python implementation
     solver_python_results = []
     for i in range(num_trials):
         start_time = time.time()
         result = solver_python.gmres(A[i], b[i], x0=None, m=m, rtol=rtol, atol=atol)
+        torch.cuda.synchronize()
         elapsed_time = time.time() - start_time
         solver_python_results.append({
             "num_iterations": result.num_iterations.tolist(),

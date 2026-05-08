@@ -26,6 +26,7 @@ def gmres(
     rtol: float = 1e-5,
     atol: float = 1e-8,
     max_restarts: int | None = None,
+    trace: bool = False,
     verbose: bool = False,
 ) -> GMRESResult:
     """
@@ -47,8 +48,8 @@ def gmres(
             Defaults to 1e-8.
         max_restarts (int, optional): The maximum number of restarts.
             If None, restarts until convergence. Defaults to None.
-        verbose (bool, optional): If True, prints restart progress.
-            Defaults to False.
+        trace (bool, optional): If True, stores the solution at each restart in the GMRESResult trace. Defaults to False.
+        verbose (bool, optional): If True, prints restart progress. Defaults to False.
 
     Returns:
         GMRESResult: An object containing the solution, total iteration counts,
@@ -91,40 +92,41 @@ def gmres(
     _b = b.contiguous()
     current_x = current_x.contiguous()
 
-    # Pre-initialize in case the loop short-circuits before assignment.
-    actual_residuals = torch.full(
-        (B,), float("inf"), dtype=real_dtype, device=A.device
-    )
+    # Tolerance is constant across restarts; compute once
+    tolerance = atol + rtol * b_norm
+
+    # Reuse a zero-initialized buffer for x0 passed to CUDA kernel
+    zero_init = torch.zeros_like(_b)
+
+    # Initialize residuals to the initial residual norm (used if loop doesn't run)
+    _r0 = _b - torch.matmul(_A, current_x.unsqueeze(-1)).squeeze(-1)
+    actual_residuals = torch.linalg.norm(_r0, dim=1).to(real_dtype)
+
     i = 0
+    trace_list = []
+    if trace:
+        trace_list.append(current_x.clone().detach().cpu())
     while max_restarts is None or i < max_restarts:
         # r = b - A @ x for the current guess
-        r = _b - torch.einsum('bij,bj->bi', _A, current_x)
+        # Prefer batched matmul over einsum to reduce dispatch overhead
+        r = _b - torch.matmul(_A, current_x.unsqueeze(-1)).squeeze(-1)
 
         if verbose:
-            max_it = torch.max(total_iterations).item()
-            print(f"Restart {i}, Max Iterations: {max_it}")
+            print(f"Restart {i}, Max Iterations: {torch.max(total_iterations).item()}")
 
-        # The CUDA kernel internally computes the solution update, not the
-        # full solution. It solves Ay=r for y, where x_new = x_old + y.
-        # Therefore, the initial "guess" passed to the kernel should be a
-        # zero vector, and the "b" vector should be the current residual "r".
-        # Ensure the optional CUDA extension is present at this point for
-        # type checkers
-        assert torch_gmres_cuda is not None
-        run_hybrid = getattr(torch_gmres_cuda, "run_iterations_hybrid", None)
-        if run_hybrid is not None:
-            # type: ignore[call-arg]
-            x_update, ks, residuals = run_hybrid(
-                _A, r, torch.zeros_like(r), m, rtol, atol
-            )
-        else:
-            # type: ignore[union-attr]
-            x_update, ks, residuals = torch_gmres_cuda.run_iterations(
-                _A, r, torch.zeros_like(r), m, rtol, atol
-            )
+        # The CUDA kernel internally computes the solution update,
+        # not the full solution. It solves Ay=r for y, where x_new = x_old + y.
+        # Therefore, the initial "guess" passed to the kernel should be a zero vector,
+        # and the "b" vector should be the current residual "r".
+        x_update, ks, residuals = torch_gmres_cuda.run_iterations(
+            _A, r, zero_init, m, rtol, atol
+        )
 
         current_x += x_update
         total_iterations += ks
+
+        if trace:
+            trace_list.append(current_x.clone().detach().cpu())
 
         actual_indices = ks.view(-1, 1).to(torch.int64)
         actual_residuals = torch.gather(
@@ -132,7 +134,6 @@ def gmres(
         ).squeeze(1)
 
         # Check for convergence
-        tolerance = atol + rtol * b_norm
         if torch.all(actual_residuals <= tolerance):
             if verbose:
                 print(
@@ -144,4 +145,5 @@ def gmres(
         solution=current_x.view(B, N),
         num_iterations=total_iterations,
         residuals=actual_residuals,
+        trace=trace_list if trace else None
     )
